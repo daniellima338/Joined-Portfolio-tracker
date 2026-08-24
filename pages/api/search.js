@@ -1,22 +1,26 @@
-import yahooFinance from 'yahoo-finance2';
-
 // GET /api/search?q=novo
-// Returns [{ ticker, company }, ...]
 export default async function handler(req, res) {
   const { q } = req.query;
   if (!q || !q.trim()) return res.status(200).json([]);
 
+  const apiKey = process.env.FINNHUB_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'Server is missing FINNHUB_API_KEY' });
+
   try {
-    const results = await yahooFinance.search(q.trim());
-    const stocks = (results.quotes || [])
-      .filter((r) => r.symbol && (r.quoteType === 'EQUITY' || r.quoteType === 'ETF'))
+    const url = `https://finnhub.io/api/v1/search?q=${encodeURIComponent(q.trim())}&token=${apiKey}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'Finnhub search failed');
+
+    const stocks = (data.result || [])
+      .filter((item) => item.type === 'Common Stock' || item.type === 'ETP')
       .slice(0, 8)
-      .map((r) => ({ ticker: r.symbol, company: r.shortname || r.longname || r.symbol }));
+      .map((item) => ({ ticker: item.symbol, company: item.description }));
 
     res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=120');
     res.status(200).json(stocks);
   } catch (err) {
     console.error('search error', err);
-    res.status(500).json({ error: 'Search failed', details: String(err) });
+    res.status(500).json({ error: 'Search failed', details: String(err.message || err) });
   }
 }
