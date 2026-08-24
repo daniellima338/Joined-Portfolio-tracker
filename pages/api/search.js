@@ -13,7 +13,9 @@ export default async function handler(req, res) {
     if (!r.ok) throw new Error(data.error || 'Finnhub search failed');
 
     const stocks = (data.result || [])
-      .filter((item) => item.type === 'Common Stock' || item.type === 'ETP')
+      // symbols with a "." (e.g. NOVO-B.CO, ASML.AS) are non-US listings —
+      // unsupported on Finnhub's free plan, so we filter them out
+      .filter((item) => (item.type === 'Common Stock' || item.type === 'ETP') && !item.symbol.includes('.'))
       .slice(0, 8)
       .map((item) => ({ ticker: item.symbol, company: item.description }));
 

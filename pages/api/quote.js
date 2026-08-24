@@ -9,28 +9,34 @@ export default async function handler(req, res) {
   const symbols = tickers.split(',').map((s) => s.trim()).filter(Boolean);
   if (symbols.length === 0) return res.status(200).json({});
 
-  try {
-    const result = {};
-    await Promise.all(symbols.map(async (symbol) => {
+  const result = {};
+
+  // Each symbol is fetched independently — one unsupported/failing ticker
+  // no longer breaks quotes for everything else in your portfolio.
+  await Promise.all(symbols.map(async (symbol) => {
+    try {
       const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${apiKey}`;
       const r = await fetch(url);
       const text = await r.text();
       let data;
-      try { data = JSON.parse(text); } catch { throw new Error(`Non-JSON response for ${symbol}: ${text.slice(0, 120)}`); }
-      if (!r.ok) throw new Error(data.error || `Finnhub error for ${symbol}`);
+      try { data = JSON.parse(text); } catch { throw new Error('Non-JSON response'); }
+      if (!r.ok) throw new Error(data.error || `Finnhub error (status ${r.status})`);
+      if (data.c == null || data.c === 0) throw new Error('No price — likely not a US-listed symbol on the free plan');
+
       result[symbol] = {
-        price: data.c ?? null,
+        price: data.c,
         change: data.d ?? 0,
         changePercent: data.dp ?? 0,
         currency: 'USD',
         marketState: 'UNKNOWN',
         shortName: symbol,
       };
-    }));
-    res.setHeader('Cache-Control', 's-maxage=15, stale-while-revalidate=30');
-    res.status(200).json(result);
-  } catch (err) {
-    console.error('quote error', err);
-    res.status(500).json({ error: 'Failed to fetch quotes from Finnhub', details: String(err.message || err) });
-  }
+    } catch (err) {
+      console.error(`quote failed for ${symbol}:`, err.message || err);
+      // silently skipped — the dashboard falls back to showing purchase price for this one ticker
+    }
+  }));
+
+  res.setHeader('Cache-Control', 's-maxage=15, stale-while-revalidate=30');
+  res.status(200).json(result);
 }
