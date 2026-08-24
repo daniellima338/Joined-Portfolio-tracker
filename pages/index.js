@@ -271,6 +271,7 @@ export default function Home() {
   const [showSuggest, setShowSuggest] = useState(false);
   const [form, setForm] = useState({ ticker: '', company: '', purchasePrice: '', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
   const [addError, setAddError] = useState('');
+  const [searchError, setSearchError] = useState('');
   const searchDebounce = useRef(null);
 
   useEffect(() => {
@@ -280,8 +281,10 @@ export default function Home() {
       try {
         const results = await fetchYahooSearch(query.trim());
         setSearchResults(results);
-      } catch {
+        setSearchError(results.length === 0 ? 'Yahoo returned zero matches for this search' : '');
+      } catch (err) {
         setSearchResults([]);
+        setSearchError(err.message || 'Search request failed');
       }
     }, 300);
     return () => clearTimeout(searchDebounce.current);
@@ -598,6 +601,7 @@ export default function Home() {
                 ))}
               </div>
             )}
+            {searchError && <div className="ct-field-hint" style={{ marginTop: 6, color: 'var(--neg)' }}>{searchError}</div>}
           </div>
 
           <div>
