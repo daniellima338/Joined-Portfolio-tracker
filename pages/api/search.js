@@ -12,10 +12,11 @@ export default async function handler(req, res) {
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || 'Finnhub search failed');
 
+    // No longer filtering out non-US symbols (e.g. NOVO-B.CO) — the client
+    // will fall back to fetching those directly from Yahoo Finance if
+    // Finnhub can't price them.
     const stocks = (data.result || [])
-      // symbols with a "." (e.g. NOVO-B.CO, ASML.AS) are non-US listings —
-      // unsupported on Finnhub's free plan, so we filter them out
-      .filter((item) => (item.type === 'Common Stock' || item.type === 'ETP') && !item.symbol.includes('.'))
+      .filter((item) => item.type === 'Common Stock' || item.type === 'ETP')
       .slice(0, 8)
       .map((item) => ({ ticker: item.symbol, company: item.description }));
 

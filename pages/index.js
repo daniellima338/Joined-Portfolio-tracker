@@ -6,7 +6,7 @@ import {
 import { Search, Plus, X, TrendingUp, TrendingDown } from 'lucide-react';
 
 const OWNER_PALETTE = ['#E0A458', '#4FD1C5', '#A78BFA', '#7FB2E5', '#E58A8A', '#8FBF8F', '#D6A9E8', '#F2C14E'];
-const QUOTE_REFRESH_MS = 60000; // gentle polling — this now runs from your browser, not a shared server
+const QUOTE_REFRESH_MS = 30000;
 
 const fmtUSD = (n, decimals = 2) =>
   (n ?? 0).toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: decimals, maximumFractionDigits: decimals });
@@ -31,14 +31,11 @@ const ownerShareOfLot = (lot, price, ownerId) =>
   lot.ownerIds.includes(ownerId) ? (lot.shares * price) / lot.ownerIds.length : 0;
 
 // -----------------------------------------------------------------------------
-// Direct-from-browser Yahoo Finance access, with an automatic CORS-proxy
-// fallback. This runs on YOUR connection, not a shared cloud server — the
-// same reason it works fine for you in Excel. It's still an unofficial data
-// source, so it can break or get blocked without warning; there's no backend
-// involved anymore, so there's nothing server-side left to configure.
+// Fallback path: direct-from-browser Yahoo Finance, only used for tickers
+// Finnhub's free tier can't price (mainly non-US-only listings). Same
+// reliability caveats as before apply, but now only to this narrow slice.
 // -----------------------------------------------------------------------------
 const YAHOO_CHART_BASE = 'https://query1.finance.yahoo.com/v8/finance/chart/';
-const YAHOO_SEARCH_BASE = 'https://query1.finance.yahoo.com/v1/finance/search';
 const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
 
 async function fetchJsonWithFallback(url) {
@@ -47,14 +44,12 @@ async function fetchJsonWithFallback(url) {
     if (!res.ok) throw new Error(`status ${res.status}`);
     return await res.json();
   } catch (directErr) {
-    // Direct browser call failed (likely CORS, or Yahoo rejected it) — retry via a CORS relay.
     const res2 = await fetch(CORS_PROXY + encodeURIComponent(url));
-    if (!res2.ok) throw new Error(`Both direct and proxied requests failed (${directErr.message}; proxy status ${res2.status})`);
+    if (!res2.ok) throw new Error(`proxy status ${res2.status}`);
     return await res2.json();
   }
 }
 
-// One call gets both the live-ish price AND 30 days of history for a ticker.
 async function fetchYahooChart(ticker) {
   const url = `${YAHOO_CHART_BASE}${encodeURIComponent(ticker)}?interval=1d&range=1mo`;
   const data = await fetchJsonWithFallback(url);
@@ -74,19 +69,9 @@ async function fetchYahooChart(ticker) {
   const changePercent = prevClose ? (change / prevClose) * 100 : 0;
 
   return {
-    quote: { price, change, changePercent, currency: meta.currency || 'USD', shortName: meta.symbol || ticker },
+    quote: { price, change, changePercent, currency: meta.currency || 'USD', shortName: meta.symbol || ticker, source: 'yahoo' },
     history,
   };
-}
-
-async function fetchYahooSearch(query) {
-  const url = `${YAHOO_SEARCH_BASE}?q=${encodeURIComponent(query)}&quotesCount=8&newsCount=0`;
-  const data = await fetchJsonWithFallback(url);
-  const quotes = data?.quotes || [];
-  return quotes
-    .filter((q) => q.symbol && (q.quoteType === 'EQUITY' || q.quoteType === 'ETF'))
-    .slice(0, 8)
-    .map((q) => ({ ticker: q.symbol, company: q.shortname || q.longname || q.symbol }));
 }
 
 export default function Home() {
@@ -100,26 +85,53 @@ export default function Home() {
   const [quotes, setQuotes] = useState({});
   const [historyByTicker, setHistoryByTicker] = useState({});
   const [quotesLoading, setQuotesLoading] = useState(true);
-  const [quotesError, setQuotesError] = useState('');
+  const [unavailableTickers, setUnavailableTickers] = useState([]);
   const [lastFetched, setLastFetched] = useState(null);
 
   const uniqueTickers = useMemo(() => [...new Set(lots.map((l) => l.ticker))], [lots]);
   const tickerKey = uniqueTickers.join(',');
 
+  // Finnhub first (reliable, server-side); anything it can't price falls
+  // back to a direct Yahoo fetch from the browser, ticker by ticker.
   const refreshAll = async (tickers) => {
     if (tickers.length === 0) return;
     setQuotesLoading(true);
-    const failures = [];
-    await Promise.all(tickers.map(async (ticker) => {
+
+    let finnhubQuotes = {};
+    try {
+      const res = await fetch(`/api/quote?tickers=${encodeURIComponent(tickers.join(','))}`);
+      if (res.ok) finnhubQuotes = await res.json();
+    } catch { /* fall through — every ticker will just go to the Yahoo fallback below */ }
+
+    Object.entries(finnhubQuotes).forEach(([ticker, q]) => {
+      setQuotes((prev) => ({ ...prev, [ticker]: { ...q, source: 'finnhub' } }));
+    });
+
+    const missing = tickers.filter((t) => !finnhubQuotes[t]);
+    const stillUnavailable = [];
+
+    await Promise.all(missing.map(async (ticker) => {
       try {
         const { quote, history } = await fetchYahooChart(ticker);
         setQuotes((prev) => ({ ...prev, [ticker]: quote }));
         if (history.length > 0) setHistoryByTicker((prev) => ({ ...prev, [ticker]: history }));
-      } catch (err) {
-        failures.push(`${ticker}: ${err.message || err}`);
+      } catch {
+        stillUnavailable.push(ticker);
       }
     }));
-    setQuotesError(failures.length === tickers.length ? failures.join(' · ') : '');
+
+    // For Finnhub-covered tickers, also grab 30-day history (Stooq) if we don't have it yet
+    const finnhubTickers = Object.keys(finnhubQuotes);
+    await Promise.all(finnhubTickers.map(async (ticker) => {
+      if (historyByTicker[ticker]) return;
+      try {
+        const res = await fetch(`/api/history?ticker=${encodeURIComponent(ticker)}`);
+        const points = await res.json();
+        if (res.ok && points.length > 0) setHistoryByTicker((prev) => ({ ...prev, [ticker]: points }));
+      } catch { /* chart just won't include this ticker */ }
+    }));
+
+    setUnavailableTickers(stillUnavailable);
     setLastFetched(Date.now());
     setQuotesLoading(false);
   };
@@ -176,7 +188,7 @@ export default function Home() {
     const gainPct = cost > 0 ? (gainAbs / cost) * 100 : 0;
     const dailyAbs = (q?.change ?? 0) * l.shares;
     const dailyPct = q?.changePercent ?? 0;
-    return { ...l, currentPrice, value, cost, gainAbs, gainPct, dailyAbs, dailyPct };
+    return { ...l, currentPrice, value, cost, gainAbs, gainPct, dailyAbs, dailyPct, source: q?.source };
   }), [filteredLots, quotes]);
 
   const totalValue = useMemo(() => enriched.reduce((s, l) => s + l.value, 0), [enriched]);
@@ -195,7 +207,7 @@ export default function Home() {
       if (!byTicker[l.ticker]) {
         byTicker[l.ticker] = {
           ticker: l.ticker, company: l.company, currentPrice: l.currentPrice,
-          dailyPct: l.dailyPct, shares: 0, cost: 0, value: 0, ownerIds: [], lotIds: [],
+          dailyPct: l.dailyPct, source: l.source, shares: 0, cost: 0, value: 0, ownerIds: [], lotIds: [],
         };
       }
       const g = byTicker[l.ticker];
@@ -269,9 +281,9 @@ export default function Home() {
   const [query, setQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [showSuggest, setShowSuggest] = useState(false);
+  const [searchError, setSearchError] = useState('');
   const [form, setForm] = useState({ ticker: '', company: '', purchasePrice: '', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
   const [addError, setAddError] = useState('');
-  const [searchError, setSearchError] = useState('');
   const searchDebounce = useRef(null);
 
   useEffect(() => {
@@ -279,9 +291,10 @@ export default function Home() {
     if (searchDebounce.current) clearTimeout(searchDebounce.current);
     searchDebounce.current = setTimeout(async () => {
       try {
-        const results = await fetchYahooSearch(query.trim());
-        setSearchResults(results);
-        setSearchError(results.length === 0 ? 'Yahoo returned zero matches for this search' : '');
+        const res = await fetch(`/api/search?q=${encodeURIComponent(query.trim())}`);
+        const data = await res.json();
+        setSearchResults(res.ok ? data : []);
+        setSearchError(!res.ok ? (data.error || 'Search failed') : '');
       } catch (err) {
         setSearchResults([]);
         setSearchError(err.message || 'Search request failed');
@@ -294,10 +307,19 @@ export default function Home() {
     setForm((f) => ({ ...f, ticker: s.ticker, company: s.company }));
     setQuery(`${s.ticker} — ${s.company}`);
     setShowSuggest(false);
+    // Try Finnhub first for a price prefill, then Yahoo if Finnhub doesn't have it (e.g. non-US listing)
+    try {
+      const res = await fetch(`/api/quote?tickers=${encodeURIComponent(s.ticker)}`);
+      const data = await res.json();
+      if (data[s.ticker]?.price) {
+        setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(data[s.ticker].price) }));
+        return;
+      }
+    } catch { /* fall through to Yahoo */ }
     try {
       const { quote } = await fetchYahooChart(s.ticker);
       if (quote.price) setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(quote.price) }));
-    } catch { /* ignore — user can type a price manually */ }
+    } catch { /* user can type a price manually */ }
   };
 
   const toggleFormOwner = (id) => {
@@ -392,8 +414,9 @@ export default function Home() {
         .ct-ledger-row:last-child { border-bottom: none; }
         .ct-ledger-row:hover { background: var(--surface-hover); }
         .ct-asset-name { display: flex; flex-direction: column; }
-        .ct-asset-ticker { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 13px; }
+        .ct-asset-ticker { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 5px; }
         .ct-asset-company { color: var(--text-faint); font-size: 11px; margin-top: 1px; }
+        .ct-source-flag { font-size: 9px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-family: 'Inter'; font-weight: 700; text-transform: uppercase; cursor: help; }
         .ct-mono { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
         .ct-owner-pills { display: flex; flex-wrap: wrap; gap: 4px; }
         .ct-owner-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 100px; font-size: 10.5px; font-weight: 700; border: 1px solid; }
@@ -431,19 +454,13 @@ export default function Home() {
         <div className="ct-header">
           <div>
             <h1 className="ct-title">Commingled</h1>
-            <div className="ct-subtitle">Real Yahoo Finance data, fetched directly from your browser</div>
+            <div className="ct-subtitle">Finnhub for reliable US pricing · Yahoo Finance fallback for global listings</div>
           </div>
           <div className="ct-live">
-            <span className={`ct-live-dot ${quotesError ? 'error' : ''}`} />
-            {quotesError ? 'Some quotes failed' : quotesLoading ? 'Fetching quotes…' : `Updated ${secondsAgo != null ? `${secondsAgo}s ago` : ''}`}
+            <span className={`ct-live-dot ${unavailableTickers.length ? 'error' : ''}`} />
+            {quotesLoading ? 'Fetching quotes…' : unavailableTickers.length ? `${unavailableTickers.join(', ')} unavailable right now` : `Updated ${secondsAgo != null ? `${secondsAgo}s ago` : ''}`}
           </div>
         </div>
-
-        {quotesError && (
-          <div className="ct-error-banner">
-            Couldn't reach Yahoo Finance directly or via the fallback proxy ({quotesError}). It's usually temporary — try again shortly, or check your ticker symbols.
-          </div>
-        )}
 
         <div className="ct-tabs-row">
           <div className="ct-tabs">
@@ -558,7 +575,13 @@ export default function Home() {
           {groupedHoldings.length === 0 && <div className="ct-empty">No holdings in this view yet — add one below.</div>}
           {groupedHoldings.map((g) => (
             <div className="ct-ledger-row" key={g.id}>
-              <div className="ct-asset-name"><span className="ct-asset-ticker">{g.ticker}</span><span className="ct-asset-company">{g.company}</span></div>
+              <div className="ct-asset-name">
+                <span className="ct-asset-ticker">
+                  {g.ticker}
+                  {g.source === 'yahoo' && <span className="ct-source-flag" title="Priced via the Yahoo Finance fallback (best-effort, can be temporarily unavailable) since Finnhub doesn't cover this listing">GLOBAL</span>}
+                </span>
+                <span className="ct-asset-company">{g.company}</span>
+              </div>
               <div className="ct-owner-pills">
                 {g.ownerIds.map((oid) => ownersById[oid] ? (
                   <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
@@ -582,7 +605,7 @@ export default function Home() {
         </div>
 
         <div className="ct-section-title">Add a holding</div>
-        <div className="ct-section-sub">Search any ticker on any exchange worldwide — this now runs directly from your browser</div>
+        <div className="ct-section-sub">Search any ticker, any exchange — US listings price instantly and reliably; global-only listings use a best-effort fallback</div>
         <div className="ct-form-card">
           <div className="ct-search-wrap">
             <Search size={15} className="ct-search-icon" />
