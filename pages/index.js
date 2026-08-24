@@ -55,7 +55,7 @@ export default function Home() {
     try {
       const res = await fetch(`/api/quote?tickers=${encodeURIComponent(tickers.join(','))}`);
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to fetch quotes');
+      if (!res.ok) throw new Error(`${data.error || 'Failed to fetch quotes'}${data.details ? ' — ' + data.details : ''}`);
       setQuotes((prev) => ({ ...prev, ...data }));
       setQuotesError('');
       setLastFetched(Date.now());
