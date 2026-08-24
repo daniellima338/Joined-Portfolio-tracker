@@ -6,7 +6,7 @@ import {
 import { Search, Plus, X, TrendingUp, TrendingDown } from 'lucide-react';
 
 const OWNER_PALETTE = ['#E0A458', '#4FD1C5', '#A78BFA', '#7FB2E5', '#E58A8A', '#8FBF8F', '#D6A9E8', '#F2C14E'];
-const QUOTE_REFRESH_MS = 30000; // Yahoo data isn't real-time anyway (15-20 min delayed) — no need to poll fast
+const QUOTE_REFRESH_MS = 60000; // gentle polling — this now runs from your browser, not a shared server
 
 const fmtUSD = (n, decimals = 2) =>
   (n ?? 0).toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: decimals, maximumFractionDigits: decimals });
@@ -20,7 +20,6 @@ const seedOwners = () => ([
   { id: 'owner-alex', name: 'Alex', color: OWNER_PALETTE[1] },
 ]);
 
-// Starter holdings — edit or delete these once you're running for real.
 const seedLots = () => ([
   { ticker: 'AAPL', company: 'Apple Inc.', shares: 10, purchasePrice: 165.00, ownerIds: ['owner-daniel'], dateBought: '2024-02-14' },
   { ticker: 'MSFT', company: 'Microsoft Corp.', shares: 5, purchasePrice: 310.00, ownerIds: ['owner-daniel'], dateBought: '2023-11-03' },
@@ -31,6 +30,65 @@ const seedLots = () => ([
 const ownerShareOfLot = (lot, price, ownerId) =>
   lot.ownerIds.includes(ownerId) ? (lot.shares * price) / lot.ownerIds.length : 0;
 
+// -----------------------------------------------------------------------------
+// Direct-from-browser Yahoo Finance access, with an automatic CORS-proxy
+// fallback. This runs on YOUR connection, not a shared cloud server — the
+// same reason it works fine for you in Excel. It's still an unofficial data
+// source, so it can break or get blocked without warning; there's no backend
+// involved anymore, so there's nothing server-side left to configure.
+// -----------------------------------------------------------------------------
+const YAHOO_CHART_BASE = 'https://query1.finance.yahoo.com/v8/finance/chart/';
+const YAHOO_SEARCH_BASE = 'https://query1.finance.yahoo.com/v1/finance/search';
+const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+
+async function fetchJsonWithFallback(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    return await res.json();
+  } catch (directErr) {
+    // Direct browser call failed (likely CORS, or Yahoo rejected it) — retry via a CORS relay.
+    const res2 = await fetch(CORS_PROXY + encodeURIComponent(url));
+    if (!res2.ok) throw new Error(`Both direct and proxied requests failed (${directErr.message}; proxy status ${res2.status})`);
+    return await res2.json();
+  }
+}
+
+// One call gets both the live-ish price AND 30 days of history for a ticker.
+async function fetchYahooChart(ticker) {
+  const url = `${YAHOO_CHART_BASE}${encodeURIComponent(ticker)}?interval=1d&range=1mo`;
+  const data = await fetchJsonWithFallback(url);
+  const result = data?.chart?.result?.[0];
+  if (!result) throw new Error(data?.chart?.error?.description || `No data for ${ticker}`);
+
+  const meta = result.meta || {};
+  const timestamps = result.timestamp || [];
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const history = timestamps
+    .map((t, i) => ({ date: new Date(t * 1000).toISOString(), close: closes[i] }))
+    .filter((p) => p.close != null);
+
+  const price = meta.regularMarketPrice ?? null;
+  const prevClose = meta.previousClose ?? meta.chartPreviousClose ?? price;
+  const change = price != null && prevClose != null ? price - prevClose : 0;
+  const changePercent = prevClose ? (change / prevClose) * 100 : 0;
+
+  return {
+    quote: { price, change, changePercent, currency: meta.currency || 'USD', shortName: meta.symbol || ticker },
+    history,
+  };
+}
+
+async function fetchYahooSearch(query) {
+  const url = `${YAHOO_SEARCH_BASE}?q=${encodeURIComponent(query)}&quotesCount=8&newsCount=0`;
+  const data = await fetchJsonWithFallback(url);
+  const quotes = data?.quotes || [];
+  return quotes
+    .filter((q) => q.symbol && (q.quoteType === 'EQUITY' || q.quoteType === 'ETF'))
+    .slice(0, 8)
+    .map((q) => ({ ticker: q.symbol, company: q.shortname || q.longname || q.symbol }));
+}
+
 export default function Home() {
   const [owners, setOwners] = useState(seedOwners);
   const [lots, setLots] = useState(seedLots);
@@ -39,9 +97,8 @@ export default function Home() {
   const [showAddOwner, setShowAddOwner] = useState(false);
   const [newOwnerName, setNewOwnerName] = useState('');
 
-  // ---- real data state -----------------------------------------------------
-  const [quotes, setQuotes] = useState({});          // { TICKER: { price, change, changePercent, shortName, ... } }
-  const [historyByTicker, setHistoryByTicker] = useState({}); // { TICKER: [{date, close}, ...] }
+  const [quotes, setQuotes] = useState({});
+  const [historyByTicker, setHistoryByTicker] = useState({});
   const [quotesLoading, setQuotesLoading] = useState(true);
   const [quotesError, setQuotesError] = useState('');
   const [lastFetched, setLastFetched] = useState(null);
@@ -49,44 +106,29 @@ export default function Home() {
   const uniqueTickers = useMemo(() => [...new Set(lots.map((l) => l.ticker))], [lots]);
   const tickerKey = uniqueTickers.join(',');
 
-  const refreshQuotes = async (tickers) => {
+  const refreshAll = async (tickers) => {
     if (tickers.length === 0) return;
     setQuotesLoading(true);
-    try {
-      const res = await fetch(`/api/quote?tickers=${encodeURIComponent(tickers.join(','))}`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(`${data.error || 'Failed to fetch quotes'}${data.details ? ' — ' + data.details : ''}`);
-      setQuotes((prev) => ({ ...prev, ...data }));
-      setQuotesError('');
-      setLastFetched(Date.now());
-    } catch (err) {
-      setQuotesError(err.message || 'Failed to fetch quotes');
-    } finally {
-      setQuotesLoading(false);
-    }
+    const failures = [];
+    await Promise.all(tickers.map(async (ticker) => {
+      try {
+        const { quote, history } = await fetchYahooChart(ticker);
+        setQuotes((prev) => ({ ...prev, [ticker]: quote }));
+        if (history.length > 0) setHistoryByTicker((prev) => ({ ...prev, [ticker]: history }));
+      } catch (err) {
+        failures.push(`${ticker}: ${err.message || err}`);
+      }
+    }));
+    setQuotesError(failures.length === tickers.length ? failures.join(' · ') : '');
+    setLastFetched(Date.now());
+    setQuotesLoading(false);
   };
 
-  // fetch quotes on mount / whenever the set of tickers changes, then poll
   useEffect(() => {
     if (uniqueTickers.length === 0) return;
-    refreshQuotes(uniqueTickers);
-    const id = setInterval(() => refreshQuotes(uniqueTickers), QUOTE_REFRESH_MS);
+    refreshAll(uniqueTickers);
+    const id = setInterval(() => refreshAll(uniqueTickers), QUOTE_REFRESH_MS);
     return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tickerKey]);
-
-  // fetch 30-day history for any ticker we don't already have
-  useEffect(() => {
-    uniqueTickers.forEach(async (t) => {
-      if (historyByTicker[t]) return;
-      try {
-        const res = await fetch(`/api/history?ticker=${encodeURIComponent(t)}`);
-        const points = await res.json();
-        if (res.ok) setHistoryByTicker((prev) => ({ ...prev, [t]: points }));
-      } catch {
-        // silently skip — the chart just won't include this ticker
-      }
-    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tickerKey]);
 
@@ -120,9 +162,6 @@ export default function Home() {
     setShowAddOwner(false);
   };
 
-  // -------------------------------------------------------------------------
-  // Derived data
-  // -------------------------------------------------------------------------
   const filteredLots = useMemo(
     () => lots.filter((l) => l.ownerIds.some((oid) => selectedOwnerIds.includes(oid))),
     [lots, selectedOwnerIds]
@@ -191,8 +230,6 @@ export default function Home() {
     return groupedHoldings.map((g, i) => ({ name: g.ticker, value: g.value, color: palette[i % palette.length] }));
   }, [donutBy, groupedHoldings, lots, quotes, owners]);
 
-  // 30-day growth chart — built from real historical closes. Assumes today's
-  // share counts held constant across the window (we don't track past lot changes).
   const chartData = useMemo(() => {
     let refTicker = null, refLen = 0;
     uniqueTickers.forEach((t) => {
@@ -229,9 +266,6 @@ export default function Home() {
     ? 'Everyone, combined'
     : selectedOwnerIds.map((id) => ownersById[id]?.name).filter(Boolean).join(' + ');
 
-  // -------------------------------------------------------------------------
-  // Add-lot form
-  // -------------------------------------------------------------------------
   const [query, setQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [showSuggest, setShowSuggest] = useState(false);
@@ -244,9 +278,8 @@ export default function Home() {
     if (searchDebounce.current) clearTimeout(searchDebounce.current);
     searchDebounce.current = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(query.trim())}`);
-        const data = await res.json();
-        if (res.ok) setSearchResults(data);
+        const results = await fetchYahooSearch(query.trim());
+        setSearchResults(results);
       } catch {
         setSearchResults([]);
       }
@@ -258,14 +291,10 @@ export default function Home() {
     setForm((f) => ({ ...f, ticker: s.ticker, company: s.company }));
     setQuery(`${s.ticker} — ${s.company}`);
     setShowSuggest(false);
-    // prefill purchase price with today's real price, editable
     try {
-      const res = await fetch(`/api/quote?tickers=${encodeURIComponent(s.ticker)}`);
-      const data = await res.json();
-      if (data[s.ticker]?.price) {
-        setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(data[s.ticker].price) }));
-      }
-    } catch { /* ignore, user can type a price manually */ }
+      const { quote } = await fetchYahooChart(s.ticker);
+      if (quote.price) setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(quote.price) }));
+    } catch { /* ignore — user can type a price manually */ }
   };
 
   const toggleFormOwner = (id) => {
@@ -293,16 +322,12 @@ export default function Home() {
     }]);
     setForm({ ticker: '', company: '', purchasePrice: '', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
     setQuery('');
-    // the ticker effect above will pick up the new symbol and fetch its quote/history automatically
   };
 
   const removeLot = (id) => setLots((prev) => prev.filter((l) => l.id !== id));
 
   const secondsAgo = lastFetched ? Math.floor((Date.now() - lastFetched) / 1000) : null;
 
-  // -------------------------------------------------------------------------
-  // Render — same visual design as before, real data underneath
-  // -------------------------------------------------------------------------
   return (
     <div className="ct-root">
       <style>{`
@@ -403,17 +428,17 @@ export default function Home() {
         <div className="ct-header">
           <div>
             <h1 className="ct-title">Commingled</h1>
-            <div className="ct-subtitle">Real Yahoo Finance data · joint ledger for two portfolios</div>
+            <div className="ct-subtitle">Real Yahoo Finance data, fetched directly from your browser</div>
           </div>
           <div className="ct-live">
             <span className={`ct-live-dot ${quotesError ? 'error' : ''}`} />
-            {quotesError ? 'Quote fetch failed' : quotesLoading ? 'Fetching quotes…' : `Updated ${secondsAgo != null ? `${secondsAgo}s ago` : ''}`}
+            {quotesError ? 'Some quotes failed' : quotesLoading ? 'Fetching quotes…' : `Updated ${secondsAgo != null ? `${secondsAgo}s ago` : ''}`}
           </div>
         </div>
 
         {quotesError && (
           <div className="ct-error-banner">
-            Couldn't reach Yahoo Finance ({quotesError}). It's usually temporary — try again shortly, or check your ticker symbols.
+            Couldn't reach Yahoo Finance directly or via the fallback proxy ({quotesError}). It's usually temporary — try again shortly, or check your ticker symbols.
           </div>
         )}
 
@@ -554,12 +579,12 @@ export default function Home() {
         </div>
 
         <div className="ct-section-title">Add a holding</div>
-        <div className="ct-section-sub">Search real tickers via Yahoo Finance, or enter details manually</div>
+        <div className="ct-section-sub">Search any ticker on any exchange worldwide — this now runs directly from your browser</div>
         <div className="ct-form-card">
           <div className="ct-search-wrap">
             <Search size={15} className="ct-search-icon" />
             <input
-              className="ct-search-input" placeholder="Search ticker or company — e.g. AAPL, Novo Nordisk…" value={query}
+              className="ct-search-input" placeholder="Search ticker or company — any exchange, any country…" value={query}
               onChange={(e) => { setQuery(e.target.value); setShowSuggest(true); setForm((f) => ({ ...f, ticker: e.target.value.toUpperCase(), company: '' })); }}
               onFocus={() => setShowSuggest(true)}
               onBlur={() => setTimeout(() => setShowSuggest(false), 150)}
