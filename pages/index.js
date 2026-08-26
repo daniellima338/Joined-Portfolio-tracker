@@ -153,6 +153,7 @@ export default function Home() {
 
   const [owners, setOwners] = useState(seedOwners);
   const [lots, setLots] = useState(seedLots);
+  const [sales, setSales] = useState([]); // realized sale records — kept separate from active holdings
   const [selectedOwnerIds, setSelectedOwnerIds] = useState(() => seedOwners().map((o) => o.id));
   const [donutBy, setDonutBy] = useState('owner');
   const [showAddOwner, setShowAddOwner] = useState(false);
@@ -200,8 +201,9 @@ export default function Home() {
         if (data && Array.isArray(data.owners) && Array.isArray(data.lots)) {
           setOwners(data.owners);
           setLots(data.lots);
+          setSales(Array.isArray(data.sales) ? data.sales : []);
           setSelectedOwnerIds(data.owners.map((o) => o.id));
-          const allIds = data.lots.map((l) => (typeof l.id === 'number' ? l.id : 0));
+          const allIds = [...data.lots, ...(data.sales || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
           idCounter = Math.max(idCounter, ...allIds, 0) + 1;
         }
       } catch {
@@ -219,13 +221,13 @@ export default function Home() {
       fetch('/api/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ owners, lots }),
+        body: JSON.stringify({ owners, lots, sales }),
       })
         .then((res) => setSaveStatus(res.ok ? 'saved' : 'error'))
         .catch(() => setSaveStatus('error'));
     }, 600);
     return () => clearTimeout(t);
-  }, [owners, lots, hasLoadedState]);
+  }, [owners, lots, sales, hasLoadedState]);
 
 
   const [quotes, setQuotes] = useState({});
@@ -387,6 +389,23 @@ export default function Home() {
     return [...groupedHoldings].sort((a, b) => b.gainPct - a.gainPct)[0];
   }, [groupedHoldings]);
 
+  const salesEnriched = useMemo(() => {
+    return sales
+      .filter((s) => s.ownerIds.some((oid) => selectedOwnerIds.includes(oid)))
+      .map((s) => {
+        const costBasisTotal = s.costBasisPerShare * s.shares;
+        const gainPct = costBasisTotal > 0 ? (s.realizedGainAbs / costBasisTotal) * 100 : 0;
+        const gainAbsDisplay = fromUSD(toUSD(s.realizedGainAbs, s.currency), displayCurrency);
+        return { ...s, gainPct, gainAbsDisplay };
+      })
+      .sort((a, b) => new Date(b.saleDate) - new Date(a.saleDate));
+  }, [sales, selectedOwnerIds, displayCurrency, fxRates]);
+
+  const totalRealizedDisplay = useMemo(
+    () => salesEnriched.reduce((s, r) => s + r.gainAbsDisplay, 0),
+    [salesEnriched]
+  );
+
   const donutData = useMemo(() => {
     if (donutBy === 'owner') {
       return owners.map((o) => {
@@ -450,11 +469,14 @@ export default function Home() {
   const [addError, setAddError] = useState('');
   const [showCalendar, setShowCalendar] = useState(false);
   const dateFieldRef = useRef(null);
+  const [showSellCalendar, setShowSellCalendar] = useState(false);
+  const sellDateFieldRef = useRef(null);
   const searchDebounce = useRef(null);
 
   useEffect(() => {
     const handler = (e) => {
       if (dateFieldRef.current && !dateFieldRef.current.contains(e.target)) setShowCalendar(false);
+      if (sellDateFieldRef.current && !sellDateFieldRef.current.contains(e.target)) setShowSellCalendar(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -526,6 +548,58 @@ export default function Home() {
 
   const removeLot = (id) => setLots((prev) => prev.filter((l) => l.id !== id));
 
+  // ---- selling: reduces shares (proportionally across the ticker's lots),
+  // realized gain is booked against the weighted-average cost, average-cost
+  // method — consistent with how buys are already merged/averaged. ----
+  const [expandedTicker, setExpandedTicker] = useState(null);
+  const [sellForm, setSellForm] = useState(null); // { ticker, company, currency, maxShares, avgCost, currentPrice, shares, price, date } | null
+  const [sellError, setSellError] = useState('');
+
+  const openSellForm = (g) => {
+    setSellError('');
+    setSellForm({
+      ticker: g.ticker, company: g.company, currency: g.currency,
+      maxShares: g.shares, avgCost: g.purchasePrice, currentPrice: g.currentPrice,
+      shares: String(g.shares), price: g.currentPrice ? String(g.currentPrice) : '', date: toDateStr(new Date()),
+    });
+  };
+
+  const confirmSell = () => {
+    if (!sellForm) return;
+    const sharesToSell = parseFloat(sellForm.shares);
+    const sellPrice = parseFloat(sellForm.price);
+    if (!sharesToSell || sharesToSell <= 0) return setSellError('Enter a number of shares greater than 0.');
+    if (sharesToSell > sellForm.maxShares + 0.0001) return setSellError(`You only hold ${sellForm.maxShares} shares of this.`);
+    if (!sellPrice || sellPrice <= 0) return setSellError('Enter a sale price greater than 0.');
+    setSellError('');
+
+    const groupLots = lots.filter((l) => l.ticker === sellForm.ticker && l.ownerIds.some((oid) => selectedOwnerIds.includes(oid)));
+    const totalShares = groupLots.reduce((s, l) => s + l.shares, 0);
+    let remaining = sharesToSell;
+    const keptLots = [];
+    groupLots.forEach((l, idx) => {
+      const isLast = idx === groupLots.length - 1;
+      let take = isLast ? remaining : Math.min(l.shares, Math.round((l.shares / totalShares) * sharesToSell));
+      take = Math.min(take, l.shares, remaining);
+      remaining -= take;
+      if (l.shares - take > 0.0001) keptLots.push({ ...l, shares: l.shares - take });
+    });
+    const groupLotIds = new Set(groupLots.map((l) => l.id));
+    setLots((prev) => [...prev.filter((l) => !groupLotIds.has(l.id)), ...keptLots]);
+
+    const realizedGainAbs = (sellPrice - sellForm.avgCost) * sharesToSell;
+    setSales((prev) => [...prev, {
+      id: nextId(), ticker: sellForm.ticker, company: sellForm.company, currency: sellForm.currency,
+      shares: sharesToSell, costBasisPerShare: sellForm.avgCost, sellPrice, saleDate: sellForm.date,
+      ownerIds: [...new Set(groupLots.flatMap((l) => l.ownerIds))], realizedGainAbs,
+    }]);
+
+    setSellForm(null);
+  };
+
+  const removeSale = (id) => setSales((prev) => prev.filter((s) => s.id !== id));
+
+
   const secondsAgo = lastFetched ? Math.floor((Date.now() - lastFetched) / 1000) : null;
 
   return (
@@ -587,8 +661,8 @@ export default function Home() {
         .ct-section-title { font-family: 'Fraunces', serif; font-size: 18px; font-weight: 500; margin: 0 0 4px; }
         .ct-section-sub { color: var(--text-faint); font-size: 12px; margin-bottom: 14px; }
         .ct-ledger { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin-bottom: 22px; }
-        .ct-ledger-head { display: grid; grid-template-columns: 2fr 1.1fr 0.8fr 1fr 1fr 1fr 1.1fr 34px; gap: 8px; padding: 12px 18px; font-size: 10.5px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; border-bottom: 1px solid var(--border); }
-        .ct-ledger-row { display: grid; grid-template-columns: 2fr 1.1fr 0.8fr 1fr 1fr 1fr 1.1fr 34px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .ct-ledger-head { display: grid; grid-template-columns: 2fr 1.1fr 0.8fr 1fr 1fr 1fr 1.1fr 74px; gap: 8px; padding: 12px 18px; font-size: 10.5px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; border-bottom: 1px solid var(--border); }
+        .ct-ledger-row { display: grid; grid-template-columns: 2fr 1.1fr 0.8fr 1fr 1fr 1fr 1.1fr 74px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
         .ct-ledger-row:last-child { border-bottom: none; }
         .ct-ledger-row:hover { background: var(--surface-hover); }
         .ct-asset-name { display: flex; flex-direction: column; }
@@ -604,6 +678,19 @@ export default function Home() {
         .ct-remove-btn { background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 4px; border-radius: 6px; }
         .ct-remove-btn:hover { color: var(--neg); background: rgba(248,113,113,0.1); }
         .ct-lot-count { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--text-faint); text-align: center; }
+        .ct-lot-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+        .ct-sell-btn { background: none; border: 1px solid var(--border); color: var(--text-muted); font-size: 10.5px; font-weight: 700; padding: 3px 8px; border-radius: 6px; cursor: pointer; }
+        .ct-sell-btn:hover { color: var(--gold); border-color: var(--gold); }
+        .ct-expand-btn { background: none; border: none; color: var(--text-faint); font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; cursor: pointer; padding: 2px 4px; }
+        .ct-expand-btn:hover { color: var(--text); }
+        .ct-lot-subrow { display: grid; grid-template-columns: 90px 70px 100px 1fr 30px; gap: 10px; align-items: center; padding: 8px 18px 8px 34px; border-bottom: 1px solid var(--border); background: var(--bg-elevated); font-size: 11.5px; }
+        .ct-sell-form-row { padding: 14px 18px; background: var(--bg-elevated); border-bottom: 1px solid var(--border); }
+        .ct-sell-form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+        .ct-sell-form-row .ct-add-btn { width: auto; padding: 9px 18px; }
+        .ct-sold-head { display: grid; grid-template-columns: 2fr 1.1fr 0.7fr 1fr 1fr 1fr 1.1fr 34px; gap: 8px; padding: 12px 18px; font-size: 10.5px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; border-bottom: 1px solid var(--border); }
+        .ct-sold-row { display: grid; grid-template-columns: 2fr 1.1fr 0.7fr 1fr 1fr 1fr 1.1fr 34px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .ct-sold-row:last-child { border-bottom: none; }
+        .ct-sold-row:hover { background: var(--surface-hover); }
         .ct-empty { padding: 40px 20px; text-align: center; color: var(--text-faint); font-size: 13px; }
         .ct-form-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
         .ct-search-wrap { position: relative; margin-bottom: 14px; }
@@ -769,40 +856,127 @@ export default function Home() {
         </div>
 
         <div className="ct-section-title">Holdings</div>
-        <div className="ct-section-sub">{filterLabel} · same ticker across owners (or multiple purchases) merges into one row with a weighted-average cost</div>
+        <div className="ct-section-sub">{filterLabel} · same ticker across owners (or multiple purchases) merges into one row with a weighted-average cost · click ×N to see and manage individual purchases</div>
         <div className="ct-ledger">
           <div className="ct-ledger-head"><div>Asset</div><div>Owner</div><div>Shares</div><div>Avg Cost</div><div>Price</div><div>Today</div><div>Value / P&amp;L</div><div /></div>
           {groupedHoldings.length === 0 && <div className="ct-empty">No holdings in this view yet — add one below.</div>}
           {groupedHoldings.map((g) => (
-            <div className="ct-ledger-row" key={g.id}>
-              <div className="ct-asset-name">
-                <span className="ct-asset-ticker">
-                  {g.ticker}
-                  {g.source === 'yahoo' && <span className="ct-source-flag" title="Priced via the Yahoo Finance fallback (best-effort, can be temporarily unavailable) since Finnhub doesn't cover this listing">GLOBAL</span>}
-                </span>
-                <span className="ct-asset-company">{g.company}</span>
+            <React.Fragment key={g.id}>
+              <div className="ct-ledger-row">
+                <div className="ct-asset-name">
+                  <span className="ct-asset-ticker">
+                    {g.ticker}
+                    {g.source === 'yahoo' && <span className="ct-source-flag" title="Priced via the Yahoo Finance fallback (best-effort, can be temporarily unavailable) since Finnhub doesn't cover this listing">GLOBAL</span>}
+                  </span>
+                  <span className="ct-asset-company">{g.company}</span>
+                </div>
+                <div className="ct-owner-pills">
+                  {g.ownerIds.map((oid) => ownersById[oid] ? (
+                    <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
+                  ) : null)}
+                </div>
+                <div className="ct-mono">{g.shares}</div>
+                <div className="ct-mono">{fmtMoney(g.purchasePrice, g.currency)}</div>
+                <div className="ct-mono">{fmtMoney(g.currentPrice, g.currency)}</div>
+                <div><span className={`ct-badge ${g.dailyPct >= 0 ? 'pos' : 'neg'}`}>{g.dailyPct >= 0 ? <TrendingUp size={11} /> : <TrendingDown size={11} />}{fmtPct(g.dailyPct)}</span></div>
+                <div className="ct-asset-name">
+                  <span className="ct-mono" style={{ fontWeight: 600 }}>{fmtMoney(g.valueDisplay, displayCurrency, 0)}</span>
+                  <span className={`ct-mono ${g.gainAbsDisplay >= 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{g.gainAbsDisplay >= 0 ? '+' : ''}{fmtMoney(g.gainAbsDisplay, displayCurrency, 0)} ({fmtPct(g.gainPct)})</span>
+                </div>
+                <div className="ct-lot-actions">
+                  <button className="ct-sell-btn" onClick={() => openSellForm(g)}>Sell</button>
+                  {g.lotIds.length === 1 ? (
+                    <button className="ct-remove-btn" onClick={() => removeLot(g.lotIds[0])} title="Remove this holding"><X size={14} /></button>
+                  ) : (
+                    <button className="ct-expand-btn" onClick={() => setExpandedTicker(expandedTicker === g.ticker ? null : g.ticker)}>
+                      ×{g.lotIds.length} {expandedTicker === g.ticker ? '▲' : '▼'}
+                    </button>
+                  )}
+                </div>
               </div>
-              <div className="ct-owner-pills">
-                {g.ownerIds.map((oid) => ownersById[oid] ? (
-                  <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
-                ) : null)}
-              </div>
-              <div className="ct-mono">{g.shares}</div>
-              <div className="ct-mono">{fmtMoney(g.purchasePrice, g.currency)}</div>
-              <div className="ct-mono">{fmtMoney(g.currentPrice, g.currency)}</div>
-              <div><span className={`ct-badge ${g.dailyPct >= 0 ? 'pos' : 'neg'}`}>{g.dailyPct >= 0 ? <TrendingUp size={11} /> : <TrendingDown size={11} />}{fmtPct(g.dailyPct)}</span></div>
-              <div className="ct-asset-name">
-                <span className="ct-mono" style={{ fontWeight: 600 }}>{fmtMoney(g.valueDisplay, displayCurrency, 0)}</span>
-                <span className={`ct-mono ${g.gainAbsDisplay >= 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{g.gainAbsDisplay >= 0 ? '+' : ''}{fmtMoney(g.gainAbsDisplay, displayCurrency, 0)} ({fmtPct(g.gainPct)})</span>
-              </div>
-              {g.lotIds.length === 1 ? (
-                <button className="ct-remove-btn" onClick={() => removeLot(g.lotIds[0])}><X size={15} /></button>
-              ) : (
-                <span className="ct-lot-count">×{g.lotIds.length}</span>
+
+              {expandedTicker === g.ticker && lots
+                .filter((l) => l.ticker === g.ticker && l.ownerIds.some((oid) => selectedOwnerIds.includes(oid)))
+                .map((l) => (
+                  <div className="ct-lot-subrow" key={l.id}>
+                    <span className="ct-mono">{l.dateBought}</span>
+                    <span className="ct-mono">{l.shares} sh</span>
+                    <span className="ct-mono">{fmtMoney(l.purchasePrice, l.currency)}</span>
+                    <div className="ct-owner-pills">
+                      {l.ownerIds.map((oid) => ownersById[oid] ? (
+                        <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
+                      ) : null)}
+                    </div>
+                    <button className="ct-remove-btn" onClick={() => removeLot(l.id)} title="Delete this individual purchase"><X size={13} /></button>
+                  </div>
+                ))}
+
+              {sellForm && sellForm.ticker === g.ticker && (
+                <div className="ct-sell-form-row">
+                  <div className="ct-sell-form-grid">
+                    <div className="ct-field">
+                      <label>Shares to sell (max {sellForm.maxShares})</label>
+                      <input type="number" step="any" min="0" max={sellForm.maxShares} value={sellForm.shares} onChange={(e) => setSellForm((f) => ({ ...f, shares: e.target.value }))} />
+                    </div>
+                    <div className="ct-field">
+                      <label>Sale price ({sellForm.currency})</label>
+                      <input type="number" step="0.01" min="0" value={sellForm.price} onChange={(e) => setSellForm((f) => ({ ...f, price: e.target.value }))} />
+                    </div>
+                    <div className="ct-field" style={{ position: 'relative' }} ref={sellDateFieldRef}>
+                      <label>Sale date</label>
+                      <button type="button" className="ct-date-trigger" onClick={() => setShowSellCalendar((s) => !s)}>
+                        <CalendarIcon size={14} />
+                        {formatDateDisplay(sellForm.date)}
+                      </button>
+                      {showSellCalendar && (
+                        <CalendarPopover value={sellForm.date} onChange={(d) => setSellForm((f) => ({ ...f, date: d }))} onClose={() => setShowSellCalendar(false)} />
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button type="button" className="ct-add-btn" onClick={confirmSell}>Confirm sale</button>
+                    <button type="button" className="ct-cancel-owner-btn" onClick={() => { setSellForm(null); setSellError(''); }}>Cancel</button>
+                  </div>
+                  {sellError && <div className="ct-field-hint" style={{ color: 'var(--neg)', marginTop: 6 }}>{sellError}</div>}
+                </div>
               )}
-            </div>
+            </React.Fragment>
           ))}
         </div>
+
+        {salesEnriched.length > 0 && (
+          <>
+            <div className="ct-section-title">Sold positions</div>
+            <div className="ct-section-sub">
+              {filterLabel} · realized gains, kept separate from your active holdings above · total realized: <span className={totalRealizedDisplay >= 0 ? 'pos' : 'neg'}>{totalRealizedDisplay >= 0 ? '+' : ''}{fmtMoney(totalRealizedDisplay, displayCurrency, 0)}</span>
+            </div>
+            <div className="ct-ledger" style={{ marginBottom: 22 }}>
+              <div className="ct-sold-head"><div>Asset</div><div>Owner</div><div>Shares</div><div>Cost Basis</div><div>Sale Price</div><div>Sold On</div><div>Realized P&amp;L</div><div /></div>
+              {salesEnriched.map((s) => (
+                <div className="ct-sold-row" key={s.id}>
+                  <div className="ct-asset-name">
+                    <span className="ct-asset-ticker">{s.ticker}</span>
+                    <span className="ct-asset-company">{s.company}</span>
+                  </div>
+                  <div className="ct-owner-pills">
+                    {s.ownerIds.map((oid) => ownersById[oid] ? (
+                      <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
+                    ) : null)}
+                  </div>
+                  <div className="ct-mono">{s.shares}</div>
+                  <div className="ct-mono">{fmtMoney(s.costBasisPerShare, s.currency)}</div>
+                  <div className="ct-mono">{fmtMoney(s.sellPrice, s.currency)}</div>
+                  <div className="ct-mono">{s.saleDate}</div>
+                  <div className="ct-asset-name">
+                    <span className={`ct-mono ${s.gainAbsDisplay >= 0 ? 'pos' : 'neg'}`} style={{ fontWeight: 600 }}>{s.gainAbsDisplay >= 0 ? '+' : ''}{fmtMoney(s.gainAbsDisplay, displayCurrency, 0)}</span>
+                    <span className={`ct-mono ${s.gainPct >= 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>({fmtPct(s.gainPct)})</span>
+                  </div>
+                  <button className="ct-remove-btn" onClick={() => removeSale(s.id)} title="Delete this sale record (does not restore the shares)"><X size={14} /></button>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
 
         <div className="ct-section-title">Add a holding</div>
         <div className="ct-section-sub">Search any ticker, any exchange — US listings price instantly and reliably; global-only listings use a best-effort fallback</div>
