@@ -95,6 +95,15 @@ const formatDateDisplay = (dateStr) => {
   if (!dateStr) return 'Select date';
   return new Date(`${dateStr}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 };
+// Flips the calendar above its trigger when there isn't enough room below the visible viewport
+const computeCalendarPos = (rect) => {
+  const estimatedHeight = 320;
+  const spaceBelow = window.innerHeight - rect.bottom;
+  if (spaceBelow < estimatedHeight + 10) {
+    return { top: Math.max(10, rect.top - estimatedHeight - 6), left: rect.left };
+  }
+  return { top: rect.bottom + 6, left: rect.left };
+};
 
 function CalendarPopover({ value, onChange, onClose, pos }) {
   const initial = value ? new Date(`${value}T00:00:00`) : new Date();
@@ -999,7 +1008,7 @@ export default function Home() {
                         type="button" className="ct-date-trigger"
                         onClick={(e) => {
                           const r = e.currentTarget.getBoundingClientRect();
-                          setSellCalendarPos({ top: r.bottom + 6, left: r.left });
+                          setSellCalendarPos(computeCalendarPos(r));
                           setShowSellCalendar((s) => !s);
                         }}
                       >
@@ -1116,7 +1125,7 @@ export default function Home() {
                   type="button" className="ct-date-trigger"
                   onClick={(e) => {
                     const r = e.currentTarget.getBoundingClientRect();
-                    setDivCalendarPos({ top: r.bottom + 6, left: r.left });
+                    setDivCalendarPos(computeCalendarPos(r));
                     setShowDivCalendar((s) => !s);
                   }}
                 >
@@ -1196,7 +1205,7 @@ export default function Home() {
                   type="button" className="ct-date-trigger"
                   onClick={(e) => {
                     const r = e.currentTarget.getBoundingClientRect();
-                    setCalendarPos({ top: r.bottom + 6, left: r.left });
+                    setCalendarPos(computeCalendarPos(r));
                     setShowCalendar((s) => !s);
                   }}
                 >
