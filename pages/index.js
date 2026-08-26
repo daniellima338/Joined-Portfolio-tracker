@@ -612,7 +612,7 @@ export default function Home() {
     return map;
   }, [lots, sales]);
 
-  const [divForm, setDivForm] = useState({ ticker: '', amount: '', date: toDateStr(new Date()), ownerIds: [] });
+  const [divForm, setDivForm] = useState({ ticker: '', amount: '', currency: 'USD', date: toDateStr(new Date()), ownerIds: [] });
   const [divError, setDivError] = useState('');
   const [showDivCalendar, setShowDivCalendar] = useState(false);
   const divDateFieldRef = useRef(null);
@@ -624,12 +624,12 @@ export default function Home() {
     if (!amount || amount <= 0) return setDivError('Enter an amount greater than 0.');
     if (divForm.ownerIds.length === 0) return setDivError('Select at least one owner.');
     setDivError('');
-    const info = knownTickers[ticker] || { company: ticker, currency: 'USD' };
+    const info = knownTickers[ticker] || { company: ticker };
     setDividends((prev) => [...prev, {
-      id: nextId(), ticker, company: info.company, currency: info.currency,
+      id: nextId(), ticker, company: info.company, currency: divForm.currency,
       amount, payDate: divForm.date, ownerIds: divForm.ownerIds,
     }]);
-    setDivForm({ ticker: '', amount: '', date: toDateStr(new Date()), ownerIds: [] });
+    setDivForm({ ticker: '', amount: '', currency: 'USD', date: toDateStr(new Date()), ownerIds: [] });
   };
 
   const removeDividend = (id) => setDividends((prev) => prev.filter((d) => d.id !== id));
@@ -1073,14 +1073,27 @@ export default function Home() {
             <div className="ct-div-form-grid">
               <div className="ct-field">
                 <label>Stock</label>
-                <select className="ct-currency-select" style={{ width: '100%' }} value={divForm.ticker} onChange={(e) => setDivForm((f) => ({ ...f, ticker: e.target.value }))}>
+                <select
+                  className="ct-currency-select" style={{ width: '100%' }} value={divForm.ticker}
+                  onChange={(e) => {
+                    const t = e.target.value;
+                    setDivForm((f) => ({ ...f, ticker: t, currency: knownTickers[t]?.currency || f.currency }));
+                  }}
+                >
                   <option value="">Select…</option>
                   {Object.keys(knownTickers).map((t) => <option key={t} value={t}>{t}</option>)}
                 </select>
               </div>
               <div className="ct-field">
-                <label>Amount received {divForm.ticker ? `(${knownTickers[divForm.ticker]?.currency || 'USD'})` : ''}</label>
-                <input type="number" step="0.01" min="0" value={divForm.amount} onChange={(e) => setDivForm((f) => ({ ...f, amount: e.target.value }))} placeholder="120.00" />
+                <label>Amount received</label>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input type="number" step="0.01" min="0" value={divForm.amount} onChange={(e) => setDivForm((f) => ({ ...f, amount: e.target.value }))} placeholder="120.00" style={{ flex: 1 }} />
+                  <select className="ct-currency-select" value={divForm.currency} onChange={(e) => setDivForm((f) => ({ ...f, currency: e.target.value }))}>
+                    {DISPLAY_CURRENCIES.includes(divForm.currency) ? null : <option value={divForm.currency}>{divForm.currency}</option>}
+                    {DISPLAY_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <span className="ct-field-hint">Whatever currency actually landed in the account — brokers sometimes convert it, even if the stock itself trades in a different currency</span>
               </div>
               <div className="ct-field" style={{ position: 'relative' }} ref={divDateFieldRef}>
                 <label>Payment date</label>
