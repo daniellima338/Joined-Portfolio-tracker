@@ -154,6 +154,7 @@ export default function Home() {
   const [owners, setOwners] = useState(seedOwners);
   const [lots, setLots] = useState(seedLots);
   const [sales, setSales] = useState([]); // realized sale records — kept separate from active holdings
+  const [dividends, setDividends] = useState([]); // manually logged dividend payments
   const [selectedOwnerIds, setSelectedOwnerIds] = useState(() => seedOwners().map((o) => o.id));
   const [donutBy, setDonutBy] = useState('owner');
   const [showAddOwner, setShowAddOwner] = useState(false);
@@ -202,8 +203,9 @@ export default function Home() {
           setOwners(data.owners);
           setLots(data.lots);
           setSales(Array.isArray(data.sales) ? data.sales : []);
+          setDividends(Array.isArray(data.dividends) ? data.dividends : []);
           setSelectedOwnerIds(data.owners.map((o) => o.id));
-          const allIds = [...data.lots, ...(data.sales || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
+          const allIds = [...data.lots, ...(data.sales || []), ...(data.dividends || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
           idCounter = Math.max(idCounter, ...allIds, 0) + 1;
         }
       } catch {
@@ -221,13 +223,13 @@ export default function Home() {
       fetch('/api/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ owners, lots, sales }),
+        body: JSON.stringify({ owners, lots, sales, dividends }),
       })
         .then((res) => setSaveStatus(res.ok ? 'saved' : 'error'))
         .catch(() => setSaveStatus('error'));
     }, 600);
     return () => clearTimeout(t);
-  }, [owners, lots, sales, hasLoadedState]);
+  }, [owners, lots, sales, dividends, hasLoadedState]);
 
 
   const [quotes, setQuotes] = useState({});
@@ -477,6 +479,7 @@ export default function Home() {
     const handler = (e) => {
       if (dateFieldRef.current && !dateFieldRef.current.contains(e.target)) setShowCalendar(false);
       if (sellDateFieldRef.current && !sellDateFieldRef.current.contains(e.target)) setShowSellCalendar(false);
+      if (divDateFieldRef.current && !divDateFieldRef.current.contains(e.target)) setShowDivCalendar(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -599,6 +602,60 @@ export default function Home() {
 
   const removeSale = (id) => setSales((prev) => prev.filter((s) => s.id !== id));
 
+  // ---- dividends: manually logged, since actual amounts received (net of
+  // withholding tax, DRIP settings, etc.) aren't reliably derivable from
+  // free market data — the exact number only you actually know for sure. ----
+  const knownTickers = useMemo(() => {
+    const map = {};
+    lots.forEach((l) => { if (!map[l.ticker]) map[l.ticker] = { company: l.company, currency: l.currency }; });
+    sales.forEach((s) => { if (!map[s.ticker]) map[s.ticker] = { company: s.company, currency: s.currency }; });
+    return map;
+  }, [lots, sales]);
+
+  const [divForm, setDivForm] = useState({ ticker: '', amount: '', date: toDateStr(new Date()), ownerIds: [] });
+  const [divError, setDivError] = useState('');
+  const [showDivCalendar, setShowDivCalendar] = useState(false);
+  const divDateFieldRef = useRef(null);
+
+  const addDividend = () => {
+    const ticker = divForm.ticker;
+    if (!ticker) return setDivError('Select which stock this dividend was from.');
+    const amount = parseFloat(divForm.amount);
+    if (!amount || amount <= 0) return setDivError('Enter an amount greater than 0.');
+    if (divForm.ownerIds.length === 0) return setDivError('Select at least one owner.');
+    setDivError('');
+    const info = knownTickers[ticker] || { company: ticker, currency: 'USD' };
+    setDividends((prev) => [...prev, {
+      id: nextId(), ticker, company: info.company, currency: info.currency,
+      amount, payDate: divForm.date, ownerIds: divForm.ownerIds,
+    }]);
+    setDivForm({ ticker: '', amount: '', date: toDateStr(new Date()), ownerIds: [] });
+  };
+
+  const removeDividend = (id) => setDividends((prev) => prev.filter((d) => d.id !== id));
+
+  const toggleDivFormOwner = (id) => {
+    setDivForm((f) => ({
+      ...f,
+      ownerIds: f.ownerIds.includes(id) ? f.ownerIds.filter((x) => x !== id) : [...f.ownerIds, id],
+    }));
+  };
+
+  const dividendsEnriched = useMemo(() => {
+    return dividends
+      .filter((d) => d.ownerIds.some((oid) => selectedOwnerIds.includes(oid)))
+      .map((d) => ({ ...d, amountDisplay: fromUSD(toUSD(d.amount, d.currency), displayCurrency) }))
+      .sort((a, b) => new Date(b.payDate) - new Date(a.payDate));
+  }, [dividends, selectedOwnerIds, displayCurrency, fxRates]);
+
+  const totalDividendsDisplay = useMemo(
+    () => dividendsEnriched.reduce((s, d) => s + d.amountDisplay, 0),
+    [dividendsEnriched]
+  );
+
+  const totalReturnDisplay = totalGainAbs + totalRealizedDisplay + totalDividendsDisplay;
+
+
 
   const secondsAgo = lastFetched ? Math.floor((Date.now() - lastFetched) / 1000) : null;
 
@@ -691,6 +748,12 @@ export default function Home() {
         .ct-sold-row { display: grid; grid-template-columns: 2fr 1.1fr 0.7fr 1fr 1fr 1fr 1.1fr 34px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
         .ct-sold-row:last-child { border-bottom: none; }
         .ct-sold-row:hover { background: var(--surface-hover); }
+        .ct-div-head { display: grid; grid-template-columns: 2fr 1.3fr 1.2fr 1fr 34px; gap: 8px; padding: 12px 18px; font-size: 10.5px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; border-bottom: 1px solid var(--border); }
+        .ct-div-row { display: grid; grid-template-columns: 2fr 1.3fr 1.2fr 1fr 34px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .ct-div-row:hover { background: var(--surface-hover); }
+        .ct-div-form-row { padding: 16px 18px; background: var(--bg-elevated); }
+        .ct-div-form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1.4fr; gap: 10px; margin-bottom: 12px; }
+        @media (max-width: 900px) { .ct-div-form-grid { grid-template-columns: 1fr 1fr; } }
         .ct-empty { padding: 40px 20px; text-align: center; color: var(--text-faint); font-size: 13px; }
         .ct-form-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
         .ct-search-wrap { position: relative; margin-bottom: 14px; }
@@ -977,6 +1040,75 @@ export default function Home() {
             </div>
           </>
         )}
+
+        <div className="ct-section-title">Dividends</div>
+        <div className="ct-section-sub">
+          {filterLabel} · logged by hand, since only you know exactly what landed in the account · total received: <span className="pos">+{fmtMoney(totalDividendsDisplay, displayCurrency, 0)}</span>
+          {(sales.length > 0 || totalDividendsDisplay !== 0) && (
+            <> · total return incl. dividends &amp; realized gains: <span className={totalReturnDisplay >= 0 ? 'pos' : 'neg'}>{totalReturnDisplay >= 0 ? '+' : ''}{fmtMoney(totalReturnDisplay, displayCurrency, 0)}</span></>
+          )}
+        </div>
+        <div className="ct-ledger" style={{ marginBottom: 22 }}>
+          {dividendsEnriched.length === 0 && <div className="ct-empty">No dividends logged yet — add one below when a payment lands.</div>}
+          {dividendsEnriched.length > 0 && (
+            <div className="ct-div-head"><div>Asset</div><div>Owner</div><div>Amount</div><div>Date</div><div /></div>
+          )}
+          {dividendsEnriched.map((d) => (
+            <div className="ct-div-row" key={d.id}>
+              <div className="ct-asset-name">
+                <span className="ct-asset-ticker">{d.ticker}</span>
+                <span className="ct-asset-company">{d.company}</span>
+              </div>
+              <div className="ct-owner-pills">
+                {d.ownerIds.map((oid) => ownersById[oid] ? (
+                  <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
+                ) : null)}
+              </div>
+              <span className="ct-mono pos">+{fmtMoney(d.amount, d.currency)}</span>
+              <span className="ct-mono">{d.payDate}</span>
+              <button className="ct-remove-btn" onClick={() => removeDividend(d.id)} title="Delete this dividend record"><X size={14} /></button>
+            </div>
+          ))}
+          <div className="ct-div-form-row">
+            <div className="ct-div-form-grid">
+              <div className="ct-field">
+                <label>Stock</label>
+                <select className="ct-currency-select" style={{ width: '100%' }} value={divForm.ticker} onChange={(e) => setDivForm((f) => ({ ...f, ticker: e.target.value }))}>
+                  <option value="">Select…</option>
+                  {Object.keys(knownTickers).map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+              <div className="ct-field">
+                <label>Amount received {divForm.ticker ? `(${knownTickers[divForm.ticker]?.currency || 'USD'})` : ''}</label>
+                <input type="number" step="0.01" min="0" value={divForm.amount} onChange={(e) => setDivForm((f) => ({ ...f, amount: e.target.value }))} placeholder="120.00" />
+              </div>
+              <div className="ct-field" style={{ position: 'relative' }} ref={divDateFieldRef}>
+                <label>Payment date</label>
+                <button type="button" className="ct-date-trigger" onClick={() => setShowDivCalendar((s) => !s)}>
+                  <CalendarIcon size={14} />
+                  {formatDateDisplay(divForm.date)}
+                </button>
+                {showDivCalendar && (
+                  <CalendarPopover value={divForm.date} onChange={(d) => setDivForm((f) => ({ ...f, date: d }))} onClose={() => setShowDivCalendar(false)} />
+                )}
+              </div>
+              <div className="ct-field">
+                <label>Owner(s)</label>
+                <div className="ct-owner-select">
+                  {owners.map((o) => (
+                    <div key={o.id} className={`ct-owner-opt ${divForm.ownerIds.includes(o.id) ? 'active' : ''}`}
+                      style={divForm.ownerIds.includes(o.id) ? { background: o.color, borderColor: o.color } : {}}
+                      onClick={() => toggleDivFormOwner(o.id)}>{o.name}</div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <button type="button" className="ct-add-btn" style={{ width: 'auto', padding: '9px 18px' }} onClick={addDividend}>
+              <Plus size={16} /> Log dividend
+            </button>
+            {divError && <div className="ct-field-hint" style={{ color: 'var(--neg)', marginTop: 8 }}>{divError}</div>}
+          </div>
+        </div>
 
         <div className="ct-section-title">Add a holding</div>
         <div className="ct-section-sub">Search any ticker, any exchange — US listings price instantly and reliably; global-only listings use a best-effort fallback</div>
