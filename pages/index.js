@@ -82,6 +82,46 @@ export default function Home() {
   const [showAddOwner, setShowAddOwner] = useState(false);
   const [newOwnerName, setNewOwnerName] = useState('');
 
+  // ---- shared persistence (Upstash) -----------------------------------
+  const [hasLoadedState, setHasLoadedState] = useState(false);
+  const [saveStatus, setSaveStatus] = useState('idle'); // idle | saving | saved | error
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/state');
+        const data = await res.json();
+        if (data && Array.isArray(data.owners) && Array.isArray(data.lots)) {
+          setOwners(data.owners);
+          setLots(data.lots);
+          setSelectedOwnerIds(data.owners.map((o) => o.id));
+          const allIds = data.lots.map((l) => (typeof l.id === 'number' ? l.id : 0));
+          idCounter = Math.max(idCounter, ...allIds, 0) + 1;
+        }
+      } catch {
+        // no saved data yet, or the request failed — fall back to the seed data already in state
+      } finally {
+        setHasLoadedState(true);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!hasLoadedState) return; // don't save until we've attempted to load first — avoids overwriting a real save with seed data
+    setSaveStatus('saving');
+    const t = setTimeout(() => {
+      fetch('/api/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ owners, lots }),
+      })
+        .then((res) => setSaveStatus(res.ok ? 'saved' : 'error'))
+        .catch(() => setSaveStatus('error'));
+    }, 600);
+    return () => clearTimeout(t);
+  }, [owners, lots, hasLoadedState]);
+
+
   const [quotes, setQuotes] = useState({});
   const [historyByTicker, setHistoryByTicker] = useState({});
   const [quotesLoading, setQuotesLoading] = useState(true);
@@ -459,6 +499,8 @@ export default function Home() {
           <div className="ct-live">
             <span className={`ct-live-dot ${unavailableTickers.length ? 'error' : ''}`} />
             {quotesLoading ? 'Fetching quotes…' : unavailableTickers.length ? `${unavailableTickers.join(', ')} unavailable right now` : `Updated ${secondsAgo != null ? `${secondsAgo}s ago` : ''}`}
+            {' · '}
+            {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save failed' : hasLoadedState ? 'Saved' : 'Loading your data…'}
           </div>
         </div>
 
@@ -657,7 +699,7 @@ export default function Home() {
         </div>
 
         <div style={{ color: 'var(--text-faint)', fontSize: 11.5, textAlign: 'center', marginTop: 30 }}>
-          Data resets on page refresh — persistent storage isn't wired up yet.
+          Shared between anyone who opens this app — changes save automatically and sync across devices.
         </div>
       </div>
     </div>
