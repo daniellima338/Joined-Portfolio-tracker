@@ -10,21 +10,30 @@ const QUOTE_REFRESH_MS = 30000;
 
 const fmtUSD = (n, decimals = 2) =>
   (n ?? 0).toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+const fmtMoney = (n, currency = 'USD', decimals = 2) => {
+  try {
+    return (n ?? 0).toLocaleString(undefined, { style: 'currency', currency, minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  } catch {
+    return `${(n ?? 0).toFixed(decimals)} ${currency}`;
+  }
+};
 const fmtPct = (n) => `${n >= 0 ? '+' : ''}${(n ?? 0).toFixed(2)}%`;
+
+const DISPLAY_CURRENCIES = ['USD', 'SEK', 'EUR', 'DKK', 'NOK', 'GBP', 'JPY'];
 
 let idCounter = 1000;
 const nextId = () => idCounter++;
 
 const seedOwners = () => ([
   { id: 'owner-daniel', name: 'Daniel', color: OWNER_PALETTE[0] },
-  { id: 'owner-alex', name: 'Alex', color: OWNER_PALETTE[1] },
+  { id: 'owner-raji', name: 'Raji', color: OWNER_PALETTE[1] },
 ]);
 
 const seedLots = () => ([
   { ticker: 'AAPL', company: 'Apple Inc.', shares: 10, purchasePrice: 165.00, ownerIds: ['owner-daniel'], dateBought: '2024-02-14' },
   { ticker: 'MSFT', company: 'Microsoft Corp.', shares: 5, purchasePrice: 310.00, ownerIds: ['owner-daniel'], dateBought: '2023-11-03' },
-  { ticker: 'NVDA', company: 'NVIDIA Corp.', shares: 8, purchasePrice: 420.00, ownerIds: ['owner-alex'], dateBought: '2024-06-21' },
-  { ticker: 'VOO', company: 'Vanguard S&P 500 ETF', shares: 20, purchasePrice: 410.00, ownerIds: ['owner-daniel', 'owner-alex'], dateBought: '2023-08-17' },
+  { ticker: 'NVDA', company: 'NVIDIA Corp.', shares: 8, purchasePrice: 420.00, ownerIds: ['owner-raji'], dateBought: '2024-06-21' },
+  { ticker: 'VOO', company: 'Vanguard S&P 500 ETF', shares: 20, purchasePrice: 410.00, ownerIds: ['owner-daniel', 'owner-raji'], dateBought: '2023-08-17' },
 ]).map((h) => ({ id: nextId(), ...h }));
 
 const ownerShareOfLot = (lot, price, ownerId) =>
@@ -81,6 +90,36 @@ export default function Home() {
   const [donutBy, setDonutBy] = useState('owner');
   const [showAddOwner, setShowAddOwner] = useState(false);
   const [newOwnerName, setNewOwnerName] = useState('');
+
+  // ---- currency: fetch free daily FX rates (base USD), no key needed ----
+  const [fxRates, setFxRates] = useState({ USD: 1 });
+  const [displayCurrency, setDisplayCurrency] = useState('USD');
+
+  useEffect(() => {
+    const loadRates = () => {
+      fetch('https://open.er-api.com/v6/latest/USD')
+        .then((r) => r.json())
+        .then((data) => { if (data && data.rates) setFxRates(data.rates); })
+        .catch(() => { /* keep previous/default rates — conversions just stay approximate */ });
+    };
+    loadRates();
+    const id = setInterval(loadRates, 60 * 60 * 1000); // FX barely moves — hourly is plenty
+    return () => clearInterval(id);
+  }, []);
+
+  // amount is in `currency`; convert to USD (our internal common currency for summing)
+  const toUSD = (amount, currency) => {
+    if (!currency || currency === 'USD') return amount;
+    const rate = fxRates[currency];
+    return rate ? amount / rate : amount; // no rate available — treat as USD rather than drop it
+  };
+  // amount is in USD; convert to whatever currency the user wants to view
+  const fromUSD = (amountUSD, currency) => {
+    if (!currency || currency === 'USD') return amountUSD;
+    const rate = fxRates[currency];
+    return rate ? amountUSD * rate : amountUSD;
+  };
+  const convert = (amount, fromCurrency, toCurrency) => fromUSD(toUSD(amount, fromCurrency), toCurrency);
 
   // ---- shared persistence (Upstash) -----------------------------------
   const [hasLoadedState, setHasLoadedState] = useState(false);
@@ -221,49 +260,60 @@ export default function Home() {
 
   const enriched = useMemo(() => filteredLots.map((l) => {
     const q = quotes[l.ticker];
-    const currentPrice = q?.price ?? l.purchasePrice;
-    const value = l.shares * currentPrice;
-    const cost = l.shares * l.purchasePrice;
-    const gainAbs = value - cost;
-    const gainPct = cost > 0 ? (gainAbs / cost) * 100 : 0;
-    const dailyAbs = (q?.change ?? 0) * l.shares;
-    const dailyPct = q?.changePercent ?? 0;
-    return { ...l, currentPrice, value, cost, gainAbs, gainPct, dailyAbs, dailyPct, source: q?.source };
-  }), [filteredLots, quotes]);
+    const currency = q?.currency || 'USD';
+    const currentPrice = q?.price ?? l.purchasePrice; // native currency
+    const value = l.shares * currentPrice;             // native currency
+    const cost = l.shares * l.purchasePrice;            // native currency (assume purchase price was entered in native currency)
+    const gainAbs = value - cost;                       // native currency — fine for a same-currency ratio/display
+    const gainPct = cost > 0 ? (gainAbs / cost) * 100 : 0; // currency-invariant, no conversion needed
+    const dailyAbs = (q?.change ?? 0) * l.shares;        // native currency
+    const dailyPct = q?.changePercent ?? 0;              // currency-invariant
+    return {
+      ...l, currency, currentPrice, value, cost, gainAbs, gainPct, dailyAbs, dailyPct, source: q?.source,
+      valueUSD: toUSD(value, currency), costUSD: toUSD(cost, currency), dailyAbsUSD: toUSD(dailyAbs, currency),
+    };
+  }), [filteredLots, quotes, fxRates]);
 
-  const totalValue = useMemo(() => enriched.reduce((s, l) => s + l.value, 0), [enriched]);
-  const totalCost = useMemo(() => enriched.reduce((s, l) => s + l.cost, 0), [enriched]);
+  const totalValueUSD = useMemo(() => enriched.reduce((s, l) => s + l.valueUSD, 0), [enriched]);
+  const totalCostUSD = useMemo(() => enriched.reduce((s, l) => s + l.costUSD, 0), [enriched]);
+  const totalValue = fromUSD(totalValueUSD, displayCurrency);
+  const totalCost = fromUSD(totalCostUSD, displayCurrency);
   const totalGainAbs = totalValue - totalCost;
-  const totalGainPct = totalCost > 0 ? (totalGainAbs / totalCost) * 100 : 0;
-  const totalDailyAbs = useMemo(() => enriched.reduce((s, l) => s + l.dailyAbs, 0), [enriched]);
+  const totalGainPct = totalCostUSD > 0 ? ((totalValueUSD - totalCostUSD) / totalCostUSD) * 100 : 0;
+  const totalDailyAbsUSD = useMemo(() => enriched.reduce((s, l) => s + l.dailyAbsUSD, 0), [enriched]);
+  const totalDailyAbs = fromUSD(totalDailyAbsUSD, displayCurrency);
   const totalDailyPct = useMemo(() => {
-    const openSum = enriched.reduce((s, l) => s + l.shares * (l.currentPrice - (l.dailyAbs / (l.shares || 1))), 0);
-    return openSum > 0 ? (totalDailyAbs / openSum) * 100 : 0;
-  }, [enriched, totalDailyAbs]);
+    const openSumUSD = enriched.reduce((s, l) => s + toUSD(l.shares * (l.currentPrice - (l.dailyAbs / (l.shares || 1))), l.currency), 0);
+    return openSumUSD > 0 ? (totalDailyAbsUSD / openSumUSD) * 100 : 0;
+  }, [enriched, totalDailyAbsUSD]);
 
   const groupedHoldings = useMemo(() => {
     const byTicker = {};
     enriched.forEach((l) => {
       if (!byTicker[l.ticker]) {
         byTicker[l.ticker] = {
-          ticker: l.ticker, company: l.company, currentPrice: l.currentPrice,
-          dailyPct: l.dailyPct, source: l.source, shares: 0, cost: 0, value: 0, ownerIds: [], lotIds: [],
+          ticker: l.ticker, company: l.company, currentPrice: l.currentPrice, currency: l.currency,
+          dailyPct: l.dailyPct, source: l.source, shares: 0, cost: 0, value: 0, valueUSD: 0, costUSD: 0, ownerIds: [], lotIds: [],
         };
       }
       const g = byTicker[l.ticker];
       g.shares += l.shares;
       g.cost += l.cost;
       g.value += l.value;
+      g.valueUSD += l.valueUSD;
+      g.costUSD += l.costUSD;
       g.lotIds.push(l.id);
       l.ownerIds.forEach((oid) => { if (!g.ownerIds.includes(oid)) g.ownerIds.push(oid); });
     });
     return Object.values(byTicker).map((g) => {
-      const purchasePrice = g.shares > 0 ? g.cost / g.shares : 0;
-      const gainAbs = g.value - g.cost;
-      const gainPct = g.cost > 0 ? (gainAbs / g.cost) * 100 : 0;
-      return { ...g, purchasePrice, gainAbs, gainPct, id: g.ticker };
+      const purchasePrice = g.shares > 0 ? g.cost / g.shares : 0; // native currency
+      const gainAbs = g.value - g.cost;       // native currency
+      const gainPct = g.cost > 0 ? (gainAbs / g.cost) * 100 : 0; // currency-invariant
+      const valueDisplay = fromUSD(g.valueUSD, displayCurrency);
+      const gainAbsDisplay = fromUSD(g.valueUSD - g.costUSD, displayCurrency);
+      return { ...g, purchasePrice, gainAbs, gainPct, valueDisplay, gainAbsDisplay, id: g.ticker };
     });
-  }, [enriched]);
+  }, [enriched, displayCurrency, fxRates]);
 
   const topPerformer = useMemo(() => {
     if (groupedHoldings.length === 0) return null;
@@ -272,15 +322,18 @@ export default function Home() {
 
   const donutData = useMemo(() => {
     if (donutBy === 'owner') {
-      return owners.map((o) => ({
-        name: o.name,
-        value: Math.round(lots.reduce((s, l) => s + ownerShareOfLot(l, quotes[l.ticker]?.price ?? l.purchasePrice, o.id), 0) * 100) / 100,
-        color: o.color,
-      })).filter((d) => d.value > 0);
+      return owners.map((o) => {
+        const valueUSD = lots.reduce((s, l) => {
+          const q = quotes[l.ticker];
+          const native = ownerShareOfLot(l, q?.price ?? l.purchasePrice, o.id);
+          return s + toUSD(native, q?.currency || 'USD');
+        }, 0);
+        return { name: o.name, value: Math.round(fromUSD(valueUSD, displayCurrency) * 100) / 100, color: o.color };
+      }).filter((d) => d.value > 0);
     }
     const palette = ['#C9A24B', '#E0A458', '#4FD1C5', '#A78BFA', '#7FB2E5', '#E58A8A', '#8FBF8F', '#D6A9E8'];
-    return groupedHoldings.map((g, i) => ({ name: g.ticker, value: g.value, color: palette[i % palette.length] }));
-  }, [donutBy, groupedHoldings, lots, quotes, owners]);
+    return groupedHoldings.map((g, i) => ({ name: g.ticker, value: g.valueDisplay, color: palette[i % palette.length] }));
+  }, [donutBy, groupedHoldings, lots, quotes, owners, displayCurrency, fxRates]);
 
   const chartData = useMemo(() => {
     let refTicker = null, refLen = 0;
@@ -300,19 +353,23 @@ export default function Home() {
       return result;
     };
 
+    // Historical closes are in each ticker's native currency; converted using
+    // TODAY's FX rate throughout (exact historical FX would be overkill here —
+    // same kind of approximation as assuming today's share counts).
     return historyByTicker[refTicker].map((point) => {
-      let total = 0;
+      let totalUSD = 0;
       lots.forEach((l) => {
         if (!l.ownerIds.some((oid) => selectedOwnerIds.includes(oid))) return;
         const close = closeOnOrBefore(l.ticker, point.date);
-        if (close != null) total += l.shares * close;
+        const currency = quotes[l.ticker]?.currency || 'USD';
+        if (close != null) totalUSD += toUSD(l.shares * close, currency);
       });
       return {
         label: new Date(point.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-        value: Math.round(total * 100) / 100,
+        value: Math.round(fromUSD(totalUSD, displayCurrency) * 100) / 100,
       };
     });
-  }, [historyByTicker, lots, selectedOwnerIds, quotes, tickerKey]);
+  }, [historyByTicker, lots, selectedOwnerIds, quotes, tickerKey, displayCurrency, fxRates]);
 
   const filterLabel = isAllSelected
     ? 'Everyone, combined'
@@ -411,6 +468,9 @@ export default function Home() {
         .ct-title { font-family: 'Fraunces', serif; font-size: 30px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
         .ct-subtitle { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
         .ct-live { display: flex; align-items: center; gap: 6px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: var(--text-faint); }
+        .ct-currency-select { background: var(--surface); border: 1px solid var(--border); color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; font-weight: 600; padding: 6px 10px; border-radius: 8px; cursor: pointer; }
+        .ct-currency-select:focus { outline: none; border-color: var(--gold); }
+        .ct-fx-caption { color: var(--text-faint); font-size: 11px; margin-bottom: 14px; }
         .ct-live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--pos); }
         .ct-live-dot.error { background: var(--neg); }
         .ct-error-banner { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: var(--neg); padding: 10px 14px; border-radius: 9px; font-size: 12.5px; margin-bottom: 16px; }
@@ -496,13 +556,19 @@ export default function Home() {
             <h1 className="ct-title">Commingled</h1>
             <div className="ct-subtitle">Finnhub for reliable US pricing · Yahoo Finance fallback for global listings</div>
           </div>
-          <div className="ct-live">
-            <span className={`ct-live-dot ${unavailableTickers.length ? 'error' : ''}`} />
-            {quotesLoading ? 'Fetching quotes…' : unavailableTickers.length ? `${unavailableTickers.join(', ')} unavailable right now` : `Updated ${secondsAgo != null ? `${secondsAgo}s ago` : ''}`}
-            {' · '}
-            {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save failed' : hasLoadedState ? 'Saved' : 'Loading your data…'}
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
+            <select className="ct-currency-select" value={displayCurrency} onChange={(e) => setDisplayCurrency(e.target.value)}>
+              {DISPLAY_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <div className="ct-live">
+              <span className={`ct-live-dot ${unavailableTickers.length ? 'error' : ''}`} />
+              {quotesLoading ? 'Fetching quotes…' : unavailableTickers.length ? `${unavailableTickers.join(', ')} unavailable right now` : `Updated ${secondsAgo != null ? `${secondsAgo}s ago` : ''}`}
+              {' · '}
+              {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save failed' : hasLoadedState ? 'Saved' : 'Loading your data…'}
+            </div>
           </div>
         </div>
+        <div className="ct-fx-caption">Values shown in {displayCurrency} · each holding's own price stays in its actual trading currency</div>
 
         <div className="ct-tabs-row">
           <div className="ct-tabs">
@@ -533,17 +599,17 @@ export default function Home() {
         <div className="ct-metrics">
           <div className="ct-card">
             <div className="ct-card-label">Total Portfolio Value</div>
-            <div className="ct-card-value">{fmtUSD(totalValue, 0)}</div>
+            <div className="ct-card-value">{fmtMoney(totalValue, displayCurrency, 0)}</div>
             <div className="ct-card-sub" style={{ color: 'var(--text-faint)' }}>{groupedHoldings.length} holding{groupedHoldings.length === 1 ? '' : 's'}</div>
           </div>
           <div className="ct-card">
             <div className="ct-card-label">Overall Profit / Loss</div>
-            <div className={`ct-card-value ${totalGainAbs >= 0 ? 'pos' : 'neg'}`}>{totalGainAbs >= 0 ? '+' : ''}{fmtUSD(totalGainAbs, 0)}</div>
+            <div className={`ct-card-value ${totalGainAbs >= 0 ? 'pos' : 'neg'}`}>{totalGainAbs >= 0 ? '+' : ''}{fmtMoney(totalGainAbs, displayCurrency, 0)}</div>
             <div className={`ct-card-sub ${totalGainPct >= 0 ? 'pos' : 'neg'}`}>{totalGainPct >= 0 ? <TrendingUp size={13} /> : <TrendingDown size={13} />}{fmtPct(totalGainPct)} all-time</div>
           </div>
           <div className="ct-card">
             <div className="ct-card-label">Today's Change</div>
-            <div className={`ct-card-value ${totalDailyAbs >= 0 ? 'pos' : 'neg'}`}>{totalDailyAbs >= 0 ? '+' : ''}{fmtUSD(totalDailyAbs, 0)}</div>
+            <div className={`ct-card-value ${totalDailyAbs >= 0 ? 'pos' : 'neg'}`}>{totalDailyAbs >= 0 ? '+' : ''}{fmtMoney(totalDailyAbs, displayCurrency, 0)}</div>
             <div className={`ct-card-sub ${totalDailyPct >= 0 ? 'pos' : 'neg'}`}>{totalDailyPct >= 0 ? <TrendingUp size={13} /> : <TrendingDown size={13} />}{fmtPct(totalDailyPct)} vs. yesterday's close</div>
           </div>
           <div className="ct-card">
@@ -573,7 +639,7 @@ export default function Home() {
                 <XAxis dataKey="label" tick={{ fill: '#59626F', fontSize: 10.5, fontFamily: 'IBM Plex Mono' }} interval={4} axisLine={{ stroke: '#262E3A' }} tickLine={false} />
                 <YAxis tick={{ fill: '#59626F', fontSize: 10.5, fontFamily: 'IBM Plex Mono' }} axisLine={false} tickLine={false} width={54} tickFormatter={(v) => `$${Math.round(v / 1000)}k`} />
                 <Tooltip content={({ active, payload, label }) => active && payload && payload.length ? (
-                  <div className="ct-tooltip"><div style={{ color: '#8992A3', marginBottom: 2 }}>{label}</div><div style={{ color: '#E7E9ED', fontWeight: 600 }}>{fmtUSD(payload[0].value, 0)}</div></div>
+                  <div className="ct-tooltip"><div style={{ color: '#8992A3', marginBottom: 2 }}>{label}</div><div style={{ color: '#E7E9ED', fontWeight: 600 }}>{fmtMoney(payload[0].value, displayCurrency, 0)}</div></div>
                 ) : null} />
                 <Area type="monotone" dataKey="value" stroke="#C9A24B" strokeWidth={2} fill="url(#ctGrad)" />
               </AreaChart>
@@ -594,7 +660,7 @@ export default function Home() {
                   {donutData.map((d, i) => <Cell key={i} fill={d.color} />)}
                 </Pie>
                 <Tooltip content={({ active, payload }) => active && payload && payload.length ? (
-                  <div className="ct-tooltip"><div style={{ color: '#E7E9ED' }}>{payload[0].name}: {fmtUSD(payload[0].value, 0)}</div></div>
+                  <div className="ct-tooltip"><div style={{ color: '#E7E9ED' }}>{payload[0].name}: {fmtMoney(payload[0].value, displayCurrency, 0)}</div></div>
                 ) : null} />
               </PieChart>
             </ResponsiveContainer>
@@ -602,7 +668,7 @@ export default function Home() {
               {donutData.map((d, i) => (
                 <div className="ct-legend-row" key={i}>
                   <div className="ct-legend-left"><span className="ct-legend-swatch" style={{ background: d.color }} />{d.name}</div>
-                  <span className="ct-legend-val">{fmtUSD(d.value, 0)}</span>
+                  <span className="ct-legend-val">{fmtMoney(d.value, displayCurrency, 0)}</span>
                 </div>
               ))}
               {donutData.length === 0 && <div style={{ color: 'var(--text-faint)', fontSize: 12 }}>Nothing to show yet</div>}
@@ -630,12 +696,12 @@ export default function Home() {
                 ) : null)}
               </div>
               <div className="ct-mono">{g.shares}</div>
-              <div className="ct-mono">{fmtUSD(g.purchasePrice)}</div>
-              <div className="ct-mono">{fmtUSD(g.currentPrice)}</div>
+              <div className="ct-mono">{fmtMoney(g.purchasePrice, g.currency)}</div>
+              <div className="ct-mono">{fmtMoney(g.currentPrice, g.currency)}</div>
               <div><span className={`ct-badge ${g.dailyPct >= 0 ? 'pos' : 'neg'}`}>{g.dailyPct >= 0 ? <TrendingUp size={11} /> : <TrendingDown size={11} />}{fmtPct(g.dailyPct)}</span></div>
               <div className="ct-asset-name">
-                <span className="ct-mono" style={{ fontWeight: 600 }}>{fmtUSD(g.value, 0)}</span>
-                <span className={`ct-mono ${g.gainAbs >= 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{g.gainAbs >= 0 ? '+' : ''}{fmtUSD(g.gainAbs, 0)} ({fmtPct(g.gainPct)})</span>
+                <span className="ct-mono" style={{ fontWeight: 600 }}>{fmtMoney(g.valueDisplay, displayCurrency, 0)}</span>
+                <span className={`ct-mono ${g.gainAbsDisplay >= 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{g.gainAbsDisplay >= 0 ? '+' : ''}{fmtMoney(g.gainAbsDisplay, displayCurrency, 0)} ({fmtPct(g.gainPct)})</span>
               </div>
               {g.lotIds.length === 1 ? (
                 <button className="ct-remove-btn" onClick={() => removeLot(g.lotIds[0])}><X size={15} /></button>
@@ -675,12 +741,16 @@ export default function Home() {
                 <label>Ticker</label>
                 <input value={form.ticker} onChange={(e) => setForm((f) => ({ ...f, ticker: e.target.value.toUpperCase() }))} placeholder="AAPL" />
                 {quotes[form.ticker.trim().toUpperCase()]?.price != null && (
-                  <span className="ct-field-hint">Current price: {fmtUSD(quotes[form.ticker.trim().toUpperCase()].price)}</span>
+                  <span className="ct-field-hint">Current price: {fmtMoney(quotes[form.ticker.trim().toUpperCase()].price, quotes[form.ticker.trim().toUpperCase()].currency || 'USD')}</span>
                 )}
               </div>
               <div className="ct-field"><label>Company name</label><input value={form.company} onChange={(e) => setForm((f) => ({ ...f, company: e.target.value }))} placeholder="Apple Inc." /></div>
               <div className="ct-field"><label>Shares</label><input type="number" step="any" min="0" value={form.shares} onChange={(e) => setForm((f) => ({ ...f, shares: e.target.value }))} placeholder="10" /></div>
-              <div className="ct-field"><label>Purchase price</label><input type="number" step="0.01" min="0" value={form.purchasePrice} onChange={(e) => setForm((f) => ({ ...f, purchasePrice: e.target.value }))} placeholder="165.00" /></div>
+              <div className="ct-field">
+                <label>Purchase price</label>
+                <input type="number" step="0.01" min="0" value={form.purchasePrice} onChange={(e) => setForm((f) => ({ ...f, purchasePrice: e.target.value }))} placeholder="165.00" />
+                <span className="ct-field-hint">Enter this in the stock's own trading currency{quotes[form.ticker.trim().toUpperCase()]?.currency ? ` (${quotes[form.ticker.trim().toUpperCase()].currency})` : ''}</span>
+              </div>
               <div className="ct-field"><label>Date bought</label><input type="date" value={form.dateBought} onChange={(e) => setForm((f) => ({ ...f, dateBought: e.target.value }))} /></div>
               <div className="ct-field">
                 <label>Owner(s) — select one or more</label>
