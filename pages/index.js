@@ -26,14 +26,14 @@ const nextId = () => idCounter++;
 
 const seedOwners = () => ([
   { id: 'owner-daniel', name: 'Daniel', color: OWNER_PALETTE[0] },
-  { id: 'owner-alex', name: 'Alex', color: OWNER_PALETTE[1] },
+  { id: 'owner-raji', name: 'Raji', color: OWNER_PALETTE[1] },
 ]);
 
 const seedLots = () => ([
   { ticker: 'AAPL', company: 'Apple Inc.', shares: 10, purchasePrice: 165.00, ownerIds: ['owner-daniel'], dateBought: '2024-02-14' },
   { ticker: 'MSFT', company: 'Microsoft Corp.', shares: 5, purchasePrice: 310.00, ownerIds: ['owner-daniel'], dateBought: '2023-11-03' },
-  { ticker: 'NVDA', company: 'NVIDIA Corp.', shares: 8, purchasePrice: 420.00, ownerIds: ['owner-alex'], dateBought: '2024-06-21' },
-  { ticker: 'VOO', company: 'Vanguard S&P 500 ETF', shares: 20, purchasePrice: 410.00, ownerIds: ['owner-daniel', 'owner-alex'], dateBought: '2023-08-17' },
+  { ticker: 'NVDA', company: 'NVIDIA Corp.', shares: 8, purchasePrice: 420.00, ownerIds: ['owner-raji'], dateBought: '2024-06-21' },
+  { ticker: 'VOO', company: 'Vanguard S&P 500 ETF', shares: 20, purchasePrice: 410.00, ownerIds: ['owner-daniel', 'owner-raji'], dateBought: '2023-08-17' },
 ]).map((h) => ({ id: nextId(), ...h }));
 
 const ownerShareOfLot = (lot, price, ownerId) =>
