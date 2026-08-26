@@ -26,14 +26,14 @@ const nextId = () => idCounter++;
 
 const seedOwners = () => ([
   { id: 'owner-daniel', name: 'Daniel', color: OWNER_PALETTE[0] },
-  { id: 'owner-raji', name: 'Raji', color: OWNER_PALETTE[1] },
+  { id: 'owner-alex', name: 'Alex', color: OWNER_PALETTE[1] },
 ]);
 
 const seedLots = () => ([
-  { ticker: 'AAPL', company: 'Apple Inc.', shares: 10, purchasePrice: 165.00, ownerIds: ['owner-daniel'], dateBought: '2024-02-14' },
-  { ticker: 'MSFT', company: 'Microsoft Corp.', shares: 5, purchasePrice: 310.00, ownerIds: ['owner-daniel'], dateBought: '2023-11-03' },
-  { ticker: 'NVDA', company: 'NVIDIA Corp.', shares: 8, purchasePrice: 420.00, ownerIds: ['owner-raji'], dateBought: '2024-06-21' },
-  { ticker: 'VOO', company: 'Vanguard S&P 500 ETF', shares: 20, purchasePrice: 410.00, ownerIds: ['owner-daniel', 'owner-raji'], dateBought: '2023-08-17' },
+  { ticker: 'AAPL', company: 'Apple Inc.', shares: 10, purchasePrice: 165.00, currency: 'USD', ownerIds: ['owner-daniel'], dateBought: '2024-02-14' },
+  { ticker: 'MSFT', company: 'Microsoft Corp.', shares: 5, purchasePrice: 310.00, currency: 'USD', ownerIds: ['owner-daniel'], dateBought: '2023-11-03' },
+  { ticker: 'NVDA', company: 'NVIDIA Corp.', shares: 8, purchasePrice: 420.00, currency: 'USD', ownerIds: ['owner-alex'], dateBought: '2024-06-21' },
+  { ticker: 'VOO', company: 'Vanguard S&P 500 ETF', shares: 20, purchasePrice: 410.00, currency: 'USD', ownerIds: ['owner-daniel', 'owner-alex'], dateBought: '2023-08-17' },
 ]).map((h) => ({ id: nextId(), ...h }));
 
 const ownerShareOfLot = (lot, price, ownerId) =>
@@ -326,7 +326,7 @@ export default function Home() {
 
   const enriched = useMemo(() => filteredLots.map((l) => {
     const q = quotes[l.ticker];
-    const currency = q?.currency || 'USD';
+    const currency = q?.currency || l.currency || 'USD';
     const currentPrice = q?.price ?? l.purchasePrice; // native currency
     const value = l.shares * currentPrice;             // native currency
     const cost = l.shares * l.purchasePrice;            // native currency (assume purchase price was entered in native currency)
@@ -445,7 +445,7 @@ export default function Home() {
   const [searchResults, setSearchResults] = useState([]);
   const [showSuggest, setShowSuggest] = useState(false);
   const [searchError, setSearchError] = useState('');
-  const [form, setForm] = useState({ ticker: '', company: '', purchasePrice: '', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
+  const [form, setForm] = useState({ ticker: '', company: '', purchasePrice: '', currency: 'USD', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
   const [addError, setAddError] = useState('');
   const [showCalendar, setShowCalendar] = useState(false);
   const dateFieldRef = useRef(null);
@@ -485,14 +485,14 @@ export default function Home() {
       const res = await fetch(`/api/quote?tickers=${encodeURIComponent(s.ticker)}`);
       const data = await res.json();
       if (data[s.ticker]?.price) {
-        setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(data[s.ticker].price) }));
+        setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(data[s.ticker].price), currency: data[s.ticker].currency || 'USD' }));
         return;
       }
     } catch { /* fall through to Yahoo */ }
     try {
       const { quote } = await fetchYahooChart(s.ticker);
-      if (quote.price) setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(quote.price) }));
-    } catch { /* user can type a price manually */ }
+      if (quote.price) setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(quote.price), currency: quote.currency || f.currency }));
+    } catch { /* user can type a price and pick the currency manually */ }
   };
 
   const toggleFormOwner = (id) => {
@@ -516,9 +516,9 @@ export default function Home() {
     setAddError('');
 
     setLots((prev) => [...prev, {
-      id: nextId(), ticker, company, shares, purchasePrice, ownerIds: form.ownerIds, dateBought: form.dateBought,
+      id: nextId(), ticker, company, shares, purchasePrice, currency: form.currency || 'USD', ownerIds: form.ownerIds, dateBought: form.dateBought,
     }]);
-    setForm({ ticker: '', company: '', purchasePrice: '', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
+    setForm({ ticker: '', company: '', purchasePrice: '', currency: 'USD', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
     setQuery('');
   };
 
@@ -838,8 +838,14 @@ export default function Home() {
               <div className="ct-field"><label>Shares</label><input type="number" step="any" min="0" value={form.shares} onChange={(e) => setForm((f) => ({ ...f, shares: e.target.value }))} placeholder="10" /></div>
               <div className="ct-field">
                 <label>Purchase price</label>
-                <input type="number" step="0.01" min="0" value={form.purchasePrice} onChange={(e) => setForm((f) => ({ ...f, purchasePrice: e.target.value }))} placeholder="165.00" />
-                <span className="ct-field-hint">Enter this in the stock's own trading currency{quotes[form.ticker.trim().toUpperCase()]?.currency ? ` (${quotes[form.ticker.trim().toUpperCase()].currency})` : ''}</span>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input type="number" step="0.01" min="0" value={form.purchasePrice} onChange={(e) => setForm((f) => ({ ...f, purchasePrice: e.target.value }))} placeholder="165.00" style={{ flex: 1 }} />
+                  <select className="ct-currency-select" value={form.currency} onChange={(e) => setForm((f) => ({ ...f, currency: e.target.value }))}>
+                    {DISPLAY_CURRENCIES.includes(form.currency) ? null : <option value={form.currency}>{form.currency}</option>}
+                    {DISPLAY_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <span className="ct-field-hint">This is the stock's own trading currency, not your display currency</span>
               </div>
               <div className="ct-field" style={{ position: 'relative' }} ref={dateFieldRef}>
                 <label>Date bought</label>
