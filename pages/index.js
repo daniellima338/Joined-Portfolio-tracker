@@ -169,6 +169,9 @@ export default function Home() {
   const [lots, setLots] = useState(seedLots);
   const [sales, setSales] = useState([]); // realized sale records — kept separate from active holdings
   const [dividends, setDividends] = useState([]); // manually logged dividend payments
+  const [manualPrices, setManualPrices] = useState({}); // { [ticker]: { price, currency, updatedDate } } — user-entered overrides
+  const manualPricesRef = useRef({});
+  useEffect(() => { manualPricesRef.current = manualPrices; }, [manualPrices]);
   const [selectedOwnerIds, setSelectedOwnerIds] = useState(() => seedOwners().map((o) => o.id));
   const [donutBy, setDonutBy] = useState('owner');
   const [showAddOwner, setShowAddOwner] = useState(false);
@@ -218,6 +221,7 @@ export default function Home() {
           setLots(data.lots);
           setSales(Array.isArray(data.sales) ? data.sales : []);
           setDividends(Array.isArray(data.dividends) ? data.dividends : []);
+          setManualPrices(data.manualPrices && typeof data.manualPrices === 'object' ? data.manualPrices : {});
           setSelectedOwnerIds(data.owners.map((o) => o.id));
           const allIds = [...data.lots, ...(data.sales || []), ...(data.dividends || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
           idCounter = Math.max(idCounter, ...allIds, 0) + 1;
@@ -237,13 +241,13 @@ export default function Home() {
       fetch('/api/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ owners, lots, sales, dividends }),
+        body: JSON.stringify({ owners, lots, sales, dividends, manualPrices }),
       })
         .then((res) => setSaveStatus(res.ok ? 'saved' : 'error'))
         .catch(() => setSaveStatus('error'));
     }, 600);
     return () => clearTimeout(t);
-  }, [owners, lots, sales, dividends, hasLoadedState]);
+  }, [owners, lots, sales, dividends, manualPrices, hasLoadedState]);
 
 
   const [quotes, setQuotes] = useState({});
@@ -257,7 +261,8 @@ export default function Home() {
 
   // Finnhub first (reliable, server-side); anything it can't price falls
   // back to a direct Yahoo fetch from the browser, ticker by ticker.
-  const refreshAll = async (tickers) => {
+  const refreshAll = async (allTickers) => {
+    const tickers = allTickers.filter((t) => !manualPricesRef.current[t]);
     if (tickers.length === 0) return;
     setQuotesLoading(true);
 
@@ -344,7 +349,8 @@ export default function Home() {
   );
 
   const enriched = useMemo(() => filteredLots.map((l) => {
-    const q = quotes[l.ticker];
+    const manual = manualPrices[l.ticker];
+    const q = manual ? { price: manual.price, currency: manual.currency, change: 0, changePercent: 0, source: 'manual' } : quotes[l.ticker];
     const currency = q?.currency || l.currency || 'USD';
     const currentPrice = q?.price ?? l.purchasePrice; // native currency
     const value = l.shares * currentPrice;             // native currency
@@ -357,7 +363,7 @@ export default function Home() {
       ...l, currency, currentPrice, value, cost, gainAbs, gainPct, dailyAbs, dailyPct, source: q?.source,
       valueUSD: toUSD(value, currency), costUSD: toUSD(cost, currency), dailyAbsUSD: toUSD(dailyAbs, currency),
     };
-  }), [filteredLots, quotes, fxRates]);
+  }), [filteredLots, quotes, manualPrices, fxRates]);
 
   const totalValueUSD = useMemo(() => enriched.reduce((s, l) => s + l.valueUSD, 0), [enriched]);
   const totalCostUSD = useMemo(() => enriched.reduce((s, l) => s + l.costUSD, 0), [enriched]);
@@ -621,6 +627,36 @@ export default function Home() {
   // ---- dividends: manually logged, since actual amounts received (net of
   // withholding tax, DRIP settings, etc.) aren't reliably derivable from
   // free market data — the exact number only you actually know for sure. ----
+  // ---- manual price override: for tickers no free data source covers at
+  // all (or if you'd rather trust your own bank's number over a flaky
+  // fallback). Setting one stops automatic fetching for that ticker. ----
+  const [manualPriceForm, setManualPriceForm] = useState(null); // { ticker, currency, price } | null
+  const [manualPriceError, setManualPriceError] = useState('');
+
+  const openManualPriceForm = (g) => {
+    setManualPriceError('');
+    setManualPriceForm({
+      ticker: g.ticker, currency: g.currency,
+      price: manualPrices[g.ticker]?.price != null ? String(manualPrices[g.ticker].price) : (g.currentPrice ? String(g.currentPrice) : ''),
+    });
+  };
+
+  const saveManualPrice = () => {
+    if (!manualPriceForm) return;
+    const price = parseNum(manualPriceForm.price);
+    if (!price || price <= 0) return setManualPriceError('Enter a price greater than 0.');
+    setManualPriceError('');
+    setManualPrices((prev) => ({
+      ...prev,
+      [manualPriceForm.ticker]: { price, currency: manualPriceForm.currency, updatedDate: toDateStr(new Date()) },
+    }));
+    setManualPriceForm(null);
+  };
+
+  const clearManualPrice = (ticker) => {
+    setManualPrices((prev) => { const next = { ...prev }; delete next[ticker]; return next; });
+  };
+
   const knownTickers = useMemo(() => {
     const map = {};
     lots.forEach((l) => { if (!map[l.ticker]) map[l.ticker] = { company: l.company, currency: l.currency }; });
@@ -743,6 +779,7 @@ export default function Home() {
         .ct-asset-ticker { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 5px; }
         .ct-asset-company { color: var(--text-faint); font-size: 11px; margin-top: 1px; }
         .ct-source-flag { font-size: 9px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-family: 'Inter'; font-weight: 700; text-transform: uppercase; cursor: help; }
+        .ct-source-flag.manual { color: var(--gold); border-color: var(--gold); }
         .ct-mono { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
         .ct-owner-pills { display: flex; flex-wrap: wrap; gap: 4px; }
         .ct-owner-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 100px; font-size: 10.5px; font-weight: 700; border: 1px solid; }
@@ -807,6 +844,42 @@ export default function Home() {
         .ct-owner-opt.active { color: var(--bg); }
         .ct-add-btn { width: 100%; background: var(--gold); color: #16130A; border: none; border-radius: 9px; padding: 11px; font-weight: 700; font-size: 13.5px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; }
         .ct-tooltip { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
+
+        /* Meta wrapper is invisible to grid layout on desktop — its children
+           act as normal direct grid items, so nothing changes above 640px. */
+        .ct-cell-meta { display: contents; }
+        .ct-mobile-label { display: none; }
+
+        @media (max-width: 640px) {
+          .ct-ledger-head, .ct-sold-head, .ct-div-head { display: none; }
+
+          .ct-ledger-row, .ct-sold-row, .ct-div-row {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            grid-template-areas: "asset value" "owner owner" "meta meta" "actions actions";
+            row-gap: 8px; column-gap: 10px;
+            padding: 16px;
+          }
+          .ct-div-row { grid-template-areas: "asset amount" "owner date" "actions actions"; row-gap: 6px; }
+
+          .ct-cell-asset { grid-area: asset; }
+          .ct-cell-owner { grid-area: owner; }
+          .ct-cell-value { grid-area: value; text-align: right; align-items: flex-end; }
+          .ct-cell-amount { grid-area: amount; text-align: right; font-weight: 600; }
+          .ct-cell-date { grid-area: date; color: var(--text-faint); }
+          .ct-cell-actions { grid-area: actions; justify-self: end; }
+
+          .ct-cell-meta {
+            grid-area: meta;
+            display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px;
+            font-size: 11.5px; color: var(--text-muted);
+            padding-top: 8px; border-top: 1px solid var(--border);
+          }
+          .ct-mobile-label { display: inline; color: var(--text-faint); font-family: 'Inter'; font-weight: 700; text-transform: uppercase; font-size: 9px; letter-spacing: 0.04em; }
+
+          .ct-lot-subrow { grid-template-columns: 1fr; row-gap: 4px; padding: 10px 16px 10px 28px; }
+          .ct-sell-form-grid, .ct-div-form-grid, .ct-form-grid { grid-template-columns: 1fr; }
+        }
       `}</style>
 
       <div className="ct-wrap">
@@ -943,28 +1016,32 @@ export default function Home() {
           {groupedHoldings.map((g) => (
             <React.Fragment key={g.id}>
               <div className="ct-ledger-row">
-                <div className="ct-asset-name">
+                <div className="ct-cell-asset ct-asset-name">
                   <span className="ct-asset-ticker">
                     {g.ticker}
                     {g.source === 'yahoo' && <span className="ct-source-flag" title="Priced via the Yahoo Finance fallback (best-effort, can be temporarily unavailable) since Finnhub doesn't cover this listing">GLOBAL</span>}
+                    {g.source === 'manual' && <span className="ct-source-flag manual" title={`You're tracking this price yourself — last updated ${manualPrices[g.ticker]?.updatedDate || ''}`}>MANUAL</span>}
                   </span>
                   <span className="ct-asset-company">{g.company}</span>
                 </div>
-                <div className="ct-owner-pills">
+                <div className="ct-cell-owner ct-owner-pills">
                   {g.ownerIds.map((oid) => ownersById[oid] ? (
                     <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
                   ) : null)}
                 </div>
-                <div className="ct-mono">{g.shares}</div>
-                <div className="ct-mono">{fmtMoney(g.purchasePrice, g.currency)}</div>
-                <div className="ct-mono">{fmtMoney(g.currentPrice, g.currency)}</div>
-                <div><span className={`ct-badge ${g.dailyPct >= 0 ? 'pos' : 'neg'}`}>{g.dailyPct >= 0 ? <TrendingUp size={11} /> : <TrendingDown size={11} />}{fmtPct(g.dailyPct)}</span></div>
-                <div className="ct-asset-name">
+                <div className="ct-cell-meta">
+                  <span className="ct-mono"><span className="ct-mobile-label">Shares </span>{g.shares}</span>
+                  <span className="ct-mono"><span className="ct-mobile-label">Avg cost </span>{fmtMoney(g.purchasePrice, g.currency)}</span>
+                  <span className="ct-mono"><span className="ct-mobile-label">Price </span>{fmtMoney(g.currentPrice, g.currency)}</span>
+                  <span className={`ct-badge ${g.dailyPct >= 0 ? 'pos' : 'neg'}`}>{g.dailyPct >= 0 ? <TrendingUp size={11} /> : <TrendingDown size={11} />}{fmtPct(g.dailyPct)}</span>
+                </div>
+                <div className="ct-cell-value ct-asset-name">
                   <span className="ct-mono" style={{ fontWeight: 600 }}>{fmtMoney(g.valueDisplay, displayCurrency, 0)}</span>
                   <span className={`ct-mono ${g.gainAbsDisplay >= 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>{g.gainAbsDisplay >= 0 ? '+' : ''}{fmtMoney(g.gainAbsDisplay, displayCurrency, 0)} ({fmtPct(g.gainPct)})</span>
                 </div>
-                <div className="ct-lot-actions">
+                <div className="ct-cell-actions ct-lot-actions">
                   <button className="ct-sell-btn" onClick={() => openSellForm(g)}>Sell</button>
+                  <button className="ct-sell-btn" onClick={() => openManualPriceForm(g)}>{g.source === 'manual' ? 'Update price' : 'Set price'}</button>
                   {g.lotIds.length === 1 ? (
                     <button className="ct-remove-btn" onClick={() => removeLot(g.lotIds[0])} title="Remove this holding"><X size={14} /></button>
                   ) : (
@@ -1027,6 +1104,26 @@ export default function Home() {
                   {sellError && <div className="ct-field-hint" style={{ color: 'var(--neg)', marginTop: 6 }}>{sellError}</div>}
                 </div>
               )}
+
+              {manualPriceForm && manualPriceForm.ticker === g.ticker && (
+                <div className="ct-sell-form-row">
+                  <div className="ct-sell-form-grid" style={{ gridTemplateColumns: '1fr' }}>
+                    <div className="ct-field">
+                      <label>Current price ({manualPriceForm.currency})</label>
+                      <input type="number" step="0.01" min="0" value={manualPriceForm.price} onChange={(e) => setManualPriceForm((f) => ({ ...f, price: e.target.value }))} />
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button type="button" className="ct-add-btn" onClick={saveManualPrice}>Save price</button>
+                    {manualPrices[g.ticker] && (
+                      <button type="button" className="ct-cancel-owner-btn" onClick={() => { clearManualPrice(g.ticker); setManualPriceForm(null); }}>Remove override</button>
+                    )}
+                    <button type="button" className="ct-cancel-owner-btn" onClick={() => { setManualPriceForm(null); setManualPriceError(''); }}>Cancel</button>
+                  </div>
+                  {manualPriceError && <div className="ct-field-hint" style={{ color: 'var(--neg)', marginTop: 6 }}>{manualPriceError}</div>}
+                  {manualPrices[g.ticker] && <div className="ct-field-hint" style={{ marginTop: 6 }}>Last updated {manualPrices[g.ticker].updatedDate}</div>}
+                </div>
+              )}
             </React.Fragment>
           ))}
         </div>
@@ -1041,24 +1138,26 @@ export default function Home() {
               <div className="ct-sold-head"><div>Asset</div><div>Owner</div><div>Shares</div><div>Cost Basis</div><div>Sale Price</div><div>Sold On</div><div>Realized P&amp;L</div><div /></div>
               {salesEnriched.map((s) => (
                 <div className="ct-sold-row" key={s.id}>
-                  <div className="ct-asset-name">
+                  <div className="ct-cell-asset ct-asset-name">
                     <span className="ct-asset-ticker">{s.ticker}</span>
                     <span className="ct-asset-company">{s.company}</span>
                   </div>
-                  <div className="ct-owner-pills">
+                  <div className="ct-cell-owner ct-owner-pills">
                     {s.ownerIds.map((oid) => ownersById[oid] ? (
                       <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
                     ) : null)}
                   </div>
-                  <div className="ct-mono">{s.shares}</div>
-                  <div className="ct-mono">{fmtMoney(s.costBasisPerShare, s.currency)}</div>
-                  <div className="ct-mono">{fmtMoney(s.sellPrice, s.currency)}</div>
-                  <div className="ct-mono">{s.saleDate}</div>
-                  <div className="ct-asset-name">
+                  <div className="ct-cell-meta">
+                    <span className="ct-mono"><span className="ct-mobile-label">Shares </span>{s.shares}</span>
+                    <span className="ct-mono"><span className="ct-mobile-label">Cost basis </span>{fmtMoney(s.costBasisPerShare, s.currency)}</span>
+                    <span className="ct-mono"><span className="ct-mobile-label">Sale price </span>{fmtMoney(s.sellPrice, s.currency)}</span>
+                    <span className="ct-mono"><span className="ct-mobile-label">Sold on </span>{s.saleDate}</span>
+                  </div>
+                  <div className="ct-cell-value ct-asset-name">
                     <span className={`ct-mono ${s.gainAbsDisplay >= 0 ? 'pos' : 'neg'}`} style={{ fontWeight: 600 }}>{s.gainAbsDisplay >= 0 ? '+' : ''}{fmtMoney(s.gainAbsDisplay, displayCurrency, 0)}</span>
                     <span className={`ct-mono ${s.gainPct >= 0 ? 'pos' : 'neg'}`} style={{ fontSize: 11 }}>({fmtPct(s.gainPct)})</span>
                   </div>
-                  <button className="ct-remove-btn" onClick={() => removeSale(s.id)} title="Delete this sale record (does not restore the shares)"><X size={14} /></button>
+                  <button className="ct-cell-actions ct-remove-btn" onClick={() => removeSale(s.id)} title="Delete this sale record (does not restore the shares)"><X size={14} /></button>
                 </div>
               ))}
             </div>
@@ -1079,18 +1178,18 @@ export default function Home() {
           )}
           {dividendsEnriched.map((d) => (
             <div className="ct-div-row" key={d.id}>
-              <div className="ct-asset-name">
+              <div className="ct-cell-asset ct-asset-name">
                 <span className="ct-asset-ticker">{d.ticker}</span>
                 <span className="ct-asset-company">{d.company}</span>
               </div>
-              <div className="ct-owner-pills">
+              <div className="ct-cell-owner ct-owner-pills">
                 {d.ownerIds.map((oid) => ownersById[oid] ? (
                   <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
                 ) : null)}
               </div>
-              <span className="ct-mono pos">+{fmtMoney(d.amount, d.currency)}</span>
-              <span className="ct-mono">{d.payDate}</span>
-              <button className="ct-remove-btn" onClick={() => removeDividend(d.id)} title="Delete this dividend record"><X size={14} /></button>
+              <span className="ct-cell-amount ct-mono pos">+{fmtMoney(d.amount, d.currency)}</span>
+              <span className="ct-cell-date ct-mono">{d.payDate}</span>
+              <button className="ct-cell-actions ct-remove-btn" onClick={() => removeDividend(d.id)} title="Delete this dividend record"><X size={14} /></button>
             </div>
           ))}
           <div className="ct-div-form-row">
