@@ -96,9 +96,17 @@ const formatDateDisplay = (dateStr) => {
   return new Date(`${dateStr}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 };
 
-function CalendarPopover({ value, onChange, onClose }) {
+function CalendarPopover({ value, onChange, onClose, anchorRef }) {
   const initial = value ? new Date(`${value}T00:00:00`) : new Date();
   const [viewMonth, setViewMonth] = useState(new Date(initial.getFullYear(), initial.getMonth(), 1));
+  const [pos, setPos] = useState(null);
+
+  useEffect(() => {
+    if (anchorRef && anchorRef.current) {
+      const rect = anchorRef.current.getBoundingClientRect();
+      setPos({ top: rect.bottom + 6, left: rect.left });
+    }
+  }, [anchorRef]);
 
   const year = viewMonth.getFullYear();
   const month = viewMonth.getMonth();
@@ -121,7 +129,11 @@ function CalendarPopover({ value, onChange, onClose }) {
   };
 
   return (
-    <div className="ct-calendar-pop" onMouseDown={(e) => e.stopPropagation()}>
+    <div
+      className="ct-calendar-pop"
+      style={pos ? { position: 'fixed', top: pos.top, left: pos.left } : { visibility: 'hidden' }}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
       <div className="ct-calendar-head">
         <button type="button" onClick={() => setViewMonth(new Date(year, month - 1, 1))}><ChevronLeft size={15} /></button>
         <span>{viewMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</span>
@@ -774,7 +786,7 @@ export default function Home() {
         .ct-field-hint { font-size: 10.5px; color: var(--text-faint); margin-top: 2px; }
         .ct-date-trigger { display: flex; align-items: center; gap: 8px; background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-family: 'Inter'; font-size: 13px; cursor: pointer; text-align: left; width: 100%; }
         .ct-date-trigger:hover { border-color: var(--text-faint); }
-        .ct-calendar-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 10px; padding: 12px; width: 240px; box-shadow: 0 12px 28px rgba(0,0,0,0.45); }
+        .ct-calendar-pop { z-index: 50; background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 10px; padding: 12px; width: 240px; box-shadow: 0 12px 28px rgba(0,0,0,0.45); }
         .ct-calendar-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-family: 'Fraunces', serif; font-size: 13px; font-weight: 500; }
         .ct-calendar-head button { background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 3px; border-radius: 5px; display: flex; }
         .ct-calendar-head button:hover { color: var(--text); background: var(--surface-hover); }
@@ -993,7 +1005,7 @@ export default function Home() {
                         {formatDateDisplay(sellForm.date)}
                       </button>
                       {showSellCalendar && (
-                        <CalendarPopover value={sellForm.date} onChange={(d) => setSellForm((f) => ({ ...f, date: d }))} onClose={() => setShowSellCalendar(false)} />
+                        <CalendarPopover value={sellForm.date} onChange={(d) => setSellForm((f) => ({ ...f, date: d }))} onClose={() => setShowSellCalendar(false)} anchorRef={sellDateFieldRef} />
                       )}
                     </div>
                   </div>
@@ -1103,7 +1115,7 @@ export default function Home() {
                   {formatDateDisplay(divForm.date)}
                 </button>
                 {showDivCalendar && (
-                  <CalendarPopover value={divForm.date} onChange={(d) => setDivForm((f) => ({ ...f, date: d }))} onClose={() => setShowDivCalendar(false)} />
+                  <CalendarPopover value={divForm.date} onChange={(d) => setDivForm((f) => ({ ...f, date: d }))} onClose={() => setShowDivCalendar(false)} anchorRef={divDateFieldRef} />
                 )}
               </div>
               <div className="ct-field">
@@ -1180,6 +1192,7 @@ export default function Home() {
                     value={form.dateBought}
                     onChange={(dateStr) => setForm((f) => ({ ...f, dateBought: dateStr }))}
                     onClose={() => setShowCalendar(false)}
+                    anchorRef={dateFieldRef}
                   />
                 )}
               </div>
