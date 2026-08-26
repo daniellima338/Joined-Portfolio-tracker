@@ -96,17 +96,9 @@ const formatDateDisplay = (dateStr) => {
   return new Date(`${dateStr}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 };
 
-function CalendarPopover({ value, onChange, onClose, anchorRef }) {
+function CalendarPopover({ value, onChange, onClose, pos }) {
   const initial = value ? new Date(`${value}T00:00:00`) : new Date();
   const [viewMonth, setViewMonth] = useState(new Date(initial.getFullYear(), initial.getMonth(), 1));
-  const [pos, setPos] = useState(null);
-
-  useEffect(() => {
-    if (anchorRef && anchorRef.current) {
-      const rect = anchorRef.current.getBoundingClientRect();
-      setPos({ top: rect.bottom + 6, left: rect.left });
-    }
-  }, [anchorRef]);
 
   const year = viewMonth.getFullYear();
   const month = viewMonth.getMonth();
@@ -483,8 +475,10 @@ export default function Home() {
   const [form, setForm] = useState({ ticker: '', company: '', purchasePrice: '', currency: 'USD', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
   const [addError, setAddError] = useState('');
   const [showCalendar, setShowCalendar] = useState(false);
+  const [calendarPos, setCalendarPos] = useState(null);
   const dateFieldRef = useRef(null);
   const [showSellCalendar, setShowSellCalendar] = useState(false);
+  const [sellCalendarPos, setSellCalendarPos] = useState(null);
   const sellDateFieldRef = useRef(null);
   const searchDebounce = useRef(null);
 
@@ -628,6 +622,7 @@ export default function Home() {
   const [divForm, setDivForm] = useState({ ticker: '', amount: '', currency: 'USD', date: toDateStr(new Date()), ownerIds: [] });
   const [divError, setDivError] = useState('');
   const [showDivCalendar, setShowDivCalendar] = useState(false);
+  const [divCalendarPos, setDivCalendarPos] = useState(null);
   const divDateFieldRef = useRef(null);
 
   const addDividend = () => {
@@ -1000,12 +995,19 @@ export default function Home() {
                     </div>
                     <div className="ct-field" style={{ position: 'relative' }} ref={sellDateFieldRef}>
                       <label>Sale date</label>
-                      <button type="button" className="ct-date-trigger" onClick={() => setShowSellCalendar((s) => !s)}>
+                      <button
+                        type="button" className="ct-date-trigger"
+                        onClick={(e) => {
+                          const r = e.currentTarget.getBoundingClientRect();
+                          setSellCalendarPos({ top: r.bottom + 6, left: r.left });
+                          setShowSellCalendar((s) => !s);
+                        }}
+                      >
                         <CalendarIcon size={14} />
                         {formatDateDisplay(sellForm.date)}
                       </button>
                       {showSellCalendar && (
-                        <CalendarPopover value={sellForm.date} onChange={(d) => setSellForm((f) => ({ ...f, date: d }))} onClose={() => setShowSellCalendar(false)} anchorRef={sellDateFieldRef} />
+                        <CalendarPopover value={sellForm.date} onChange={(d) => setSellForm((f) => ({ ...f, date: d }))} onClose={() => setShowSellCalendar(false)} pos={sellCalendarPos} />
                       )}
                     </div>
                   </div>
@@ -1110,12 +1112,19 @@ export default function Home() {
               </div>
               <div className="ct-field" style={{ position: 'relative' }} ref={divDateFieldRef}>
                 <label>Payment date</label>
-                <button type="button" className="ct-date-trigger" onClick={() => setShowDivCalendar((s) => !s)}>
+                <button
+                  type="button" className="ct-date-trigger"
+                  onClick={(e) => {
+                    const r = e.currentTarget.getBoundingClientRect();
+                    setDivCalendarPos({ top: r.bottom + 6, left: r.left });
+                    setShowDivCalendar((s) => !s);
+                  }}
+                >
                   <CalendarIcon size={14} />
                   {formatDateDisplay(divForm.date)}
                 </button>
                 {showDivCalendar && (
-                  <CalendarPopover value={divForm.date} onChange={(d) => setDivForm((f) => ({ ...f, date: d }))} onClose={() => setShowDivCalendar(false)} anchorRef={divDateFieldRef} />
+                  <CalendarPopover value={divForm.date} onChange={(d) => setDivForm((f) => ({ ...f, date: d }))} onClose={() => setShowDivCalendar(false)} pos={divCalendarPos} />
                 )}
               </div>
               <div className="ct-field">
@@ -1183,7 +1192,14 @@ export default function Home() {
               </div>
               <div className="ct-field" style={{ position: 'relative' }} ref={dateFieldRef}>
                 <label>Date bought</label>
-                <button type="button" className="ct-date-trigger" onClick={() => setShowCalendar((s) => !s)}>
+                <button
+                  type="button" className="ct-date-trigger"
+                  onClick={(e) => {
+                    const r = e.currentTarget.getBoundingClientRect();
+                    setCalendarPos({ top: r.bottom + 6, left: r.left });
+                    setShowCalendar((s) => !s);
+                  }}
+                >
                   <CalendarIcon size={14} />
                   {formatDateDisplay(form.dateBought)}
                 </button>
@@ -1192,7 +1208,7 @@ export default function Home() {
                     value={form.dateBought}
                     onChange={(dateStr) => setForm((f) => ({ ...f, dateBought: dateStr }))}
                     onClose={() => setShowCalendar(false)}
-                    anchorRef={dateFieldRef}
+                    pos={calendarPos}
                   />
                 )}
               </div>
