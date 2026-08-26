@@ -18,6 +18,7 @@ const fmtMoney = (n, currency = 'USD', decimals = 2) => {
   }
 };
 const fmtPct = (n) => `${n >= 0 ? '+' : ''}${(n ?? 0).toFixed(2)}%`;
+const normalizeTicker = (raw) => raw.trim().toUpperCase().replace(/\s+/g, '-');
 
 const DISPLAY_CURRENCIES = ['USD', 'SEK', 'EUR', 'DKK', 'NOK', 'GBP', 'JPY'];
 
@@ -477,20 +478,21 @@ export default function Home() {
   }, [query]);
 
   const pickSuggestion = async (s) => {
-    setForm((f) => ({ ...f, ticker: s.ticker, company: s.company }));
-    setQuery(`${s.ticker} — ${s.company}`);
+    const ticker = normalizeTicker(s.ticker); // Finnhub's own search results sometimes use spaces instead of hyphens
+    setForm((f) => ({ ...f, ticker, company: s.company }));
+    setQuery(`${ticker} — ${s.company}`);
     setShowSuggest(false);
     // Try Finnhub first for a price prefill, then Yahoo if Finnhub doesn't have it (e.g. non-US listing)
     try {
-      const res = await fetch(`/api/quote?tickers=${encodeURIComponent(s.ticker)}`);
+      const res = await fetch(`/api/quote?tickers=${encodeURIComponent(ticker)}`);
       const data = await res.json();
-      if (data[s.ticker]?.price) {
-        setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(data[s.ticker].price), currency: data[s.ticker].currency || 'USD' }));
+      if (data[ticker]?.price) {
+        setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(data[ticker].price), currency: data[ticker].currency || 'USD' }));
         return;
       }
     } catch { /* fall through to Yahoo */ }
     try {
-      const { quote } = await fetchYahooChart(s.ticker);
+      const { quote } = await fetchYahooChart(ticker);
       if (quote.price) setForm((f) => ({ ...f, purchasePrice: f.purchasePrice || String(quote.price), currency: quote.currency || f.currency }));
     } catch { /* user can type a price and pick the currency manually */ }
   };
@@ -504,7 +506,7 @@ export default function Home() {
 
   const handleAdd = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
-    const ticker = form.ticker.trim().toUpperCase();
+    const ticker = normalizeTicker(form.ticker);
     const company = form.company.trim() || ticker;
     const shares = parseFloat(form.shares);
     const purchasePrice = parseFloat(form.purchasePrice);
@@ -809,7 +811,7 @@ export default function Home() {
             <Search size={15} className="ct-search-icon" />
             <input
               className="ct-search-input" placeholder="Search ticker or company — any exchange, any country…" value={query}
-              onChange={(e) => { setQuery(e.target.value); setShowSuggest(true); setForm((f) => ({ ...f, ticker: e.target.value.toUpperCase(), company: '' })); }}
+              onChange={(e) => { setQuery(e.target.value); setShowSuggest(true); setForm((f) => ({ ...f, ticker: normalizeTicker(e.target.value), company: '' })); }}
               onFocus={() => setShowSuggest(true)}
               onBlur={() => setTimeout(() => setShowSuggest(false), 150)}
             />
@@ -817,7 +819,7 @@ export default function Home() {
               <div className="ct-suggest">
                 {searchResults.map((s) => (
                   <div className="ct-suggest-item" key={s.ticker} onMouseDown={() => pickSuggestion(s)}>
-                    <span><span className="ct-suggest-ticker">{s.ticker}</span> <span className="ct-suggest-company">— {s.company}</span></span>
+                    <span><span className="ct-suggest-ticker">{normalizeTicker(s.ticker)}</span> <span className="ct-suggest-company">— {s.company}</span></span>
                   </div>
                 ))}
               </div>
@@ -829,7 +831,7 @@ export default function Home() {
             <div className="ct-form-grid">
               <div className="ct-field">
                 <label>Ticker</label>
-                <input value={form.ticker} onChange={(e) => setForm((f) => ({ ...f, ticker: e.target.value.toUpperCase() }))} placeholder="AAPL" />
+                <input value={form.ticker} onChange={(e) => setForm((f) => ({ ...f, ticker: normalizeTicker(e.target.value) }))} placeholder="AAPL" />
                 {quotes[form.ticker.trim().toUpperCase()]?.price != null && (
                   <span className="ct-field-hint">Current price: {fmtMoney(quotes[form.ticker.trim().toUpperCase()].price, quotes[form.ticker.trim().toUpperCase()].currency || 'USD')}</span>
                 )}
