@@ -3,7 +3,7 @@ import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell,
 } from 'recharts';
-import { Search, Plus, X, TrendingUp, TrendingDown } from 'lucide-react';
+import { Search, Plus, X, TrendingUp, TrendingDown, Calendar as CalendarIcon, ChevronLeft, ChevronRight } from 'lucide-react';
 
 const OWNER_PALETTE = ['#E0A458', '#4FD1C5', '#A78BFA', '#7FB2E5', '#E58A8A', '#8FBF8F', '#D6A9E8', '#F2C14E'];
 const QUOTE_REFRESH_MS = 30000;
@@ -26,14 +26,14 @@ const nextId = () => idCounter++;
 
 const seedOwners = () => ([
   { id: 'owner-daniel', name: 'Daniel', color: OWNER_PALETTE[0] },
-  { id: 'owner-raji', name: 'Raji', color: OWNER_PALETTE[1] },
+  { id: 'owner-alex', name: 'Alex', color: OWNER_PALETTE[1] },
 ]);
 
 const seedLots = () => ([
   { ticker: 'AAPL', company: 'Apple Inc.', shares: 10, purchasePrice: 165.00, ownerIds: ['owner-daniel'], dateBought: '2024-02-14' },
   { ticker: 'MSFT', company: 'Microsoft Corp.', shares: 5, purchasePrice: 310.00, ownerIds: ['owner-daniel'], dateBought: '2023-11-03' },
-  { ticker: 'NVDA', company: 'NVIDIA Corp.', shares: 8, purchasePrice: 420.00, ownerIds: ['owner-raji'], dateBought: '2024-06-21' },
-  { ticker: 'VOO', company: 'Vanguard S&P 500 ETF', shares: 20, purchasePrice: 410.00, ownerIds: ['owner-daniel', 'owner-raji'], dateBought: '2023-08-17' },
+  { ticker: 'NVDA', company: 'NVIDIA Corp.', shares: 8, purchasePrice: 420.00, ownerIds: ['owner-alex'], dateBought: '2024-06-21' },
+  { ticker: 'VOO', company: 'Vanguard S&P 500 ETF', shares: 20, purchasePrice: 410.00, ownerIds: ['owner-daniel', 'owner-alex'], dateBought: '2023-08-17' },
 ]).map((h) => ({ id: nextId(), ...h }));
 
 const ownerShareOfLot = (lot, price, ownerId) =>
@@ -83,7 +83,73 @@ async function fetchYahooChart(ticker) {
   };
 }
 
+const toDateStr = (date) => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+};
+const formatDateDisplay = (dateStr) => {
+  if (!dateStr) return 'Select date';
+  return new Date(`${dateStr}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+};
+
+function CalendarPopover({ value, onChange, onClose }) {
+  const initial = value ? new Date(`${value}T00:00:00`) : new Date();
+  const [viewMonth, setViewMonth] = useState(new Date(initial.getFullYear(), initial.getMonth(), 1));
+
+  const year = viewMonth.getFullYear();
+  const month = viewMonth.getMonth();
+  const startWeekday = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const todayStr = toDateStr(new Date());
+
+  const cells = [];
+  for (let i = 0; i < startWeekday; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  const selectDay = (d) => {
+    onChange(toDateStr(new Date(year, month, d)));
+    onClose();
+  };
+  const selectToday = () => {
+    const now = new Date();
+    onChange(toDateStr(now));
+    onClose();
+  };
+
+  return (
+    <div className="ct-calendar-pop" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="ct-calendar-head">
+        <button type="button" onClick={() => setViewMonth(new Date(year, month - 1, 1))}><ChevronLeft size={15} /></button>
+        <span>{viewMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</span>
+        <button type="button" onClick={() => setViewMonth(new Date(year, month + 1, 1))}><ChevronRight size={15} /></button>
+      </div>
+      <div className="ct-calendar-weekdays">
+        {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((w, i) => <span key={i}>{w}</span>)}
+      </div>
+      <div className="ct-calendar-grid">
+        {cells.map((d, i) => {
+          if (d == null) return <span key={i} />;
+          const dateStr = toDateStr(new Date(year, month, d));
+          return (
+            <button
+              type="button" key={i}
+              className={`ct-calendar-day ${dateStr === value ? 'selected' : ''} ${dateStr === todayStr ? 'today' : ''}`}
+              onClick={() => selectDay(d)}
+            >
+              {d}
+            </button>
+          );
+        })}
+      </div>
+      <button type="button" className="ct-calendar-today-btn" onClick={selectToday}>Today</button>
+    </div>
+  );
+}
+
 export default function Home() {
+
   const [owners, setOwners] = useState(seedOwners);
   const [lots, setLots] = useState(seedLots);
   const [selectedOwnerIds, setSelectedOwnerIds] = useState(() => seedOwners().map((o) => o.id));
@@ -381,7 +447,17 @@ export default function Home() {
   const [searchError, setSearchError] = useState('');
   const [form, setForm] = useState({ ticker: '', company: '', purchasePrice: '', shares: '', dateBought: new Date().toISOString().slice(0, 10), ownerIds: [] });
   const [addError, setAddError] = useState('');
+  const [showCalendar, setShowCalendar] = useState(false);
+  const dateFieldRef = useRef(null);
   const searchDebounce = useRef(null);
+
+  useEffect(() => {
+    const handler = (e) => {
+      if (dateFieldRef.current && !dateFieldRef.current.contains(e.target)) setShowCalendar(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
 
   useEffect(() => {
     if (!query.trim()) { setSearchResults([]); return; }
@@ -543,6 +619,20 @@ export default function Home() {
         .ct-field input { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-size: 13px; outline: none; }
         .ct-field input:focus { border-color: var(--gold); }
         .ct-field-hint { font-size: 10.5px; color: var(--text-faint); margin-top: 2px; }
+        .ct-date-trigger { display: flex; align-items: center; gap: 8px; background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-family: 'Inter'; font-size: 13px; cursor: pointer; text-align: left; width: 100%; }
+        .ct-date-trigger:hover { border-color: var(--text-faint); }
+        .ct-calendar-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 10px; padding: 12px; width: 240px; box-shadow: 0 12px 28px rgba(0,0,0,0.45); }
+        .ct-calendar-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-family: 'Fraunces', serif; font-size: 13px; font-weight: 500; }
+        .ct-calendar-head button { background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 3px; border-radius: 5px; display: flex; }
+        .ct-calendar-head button:hover { color: var(--text); background: var(--surface-hover); }
+        .ct-calendar-weekdays { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; font-size: 10px; color: var(--text-faint); font-weight: 700; margin-bottom: 4px; }
+        .ct-calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+        .ct-calendar-day { background: none; border: none; color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; padding: 6px 0; border-radius: 6px; cursor: pointer; }
+        .ct-calendar-day:hover { background: var(--surface-hover); }
+        .ct-calendar-day.today { color: var(--gold); font-weight: 700; }
+        .ct-calendar-day.selected { background: var(--gold); color: #16130A; font-weight: 700; }
+        .ct-calendar-today-btn { width: 100%; margin-top: 10px; background: none; border: 1px solid var(--border); color: var(--text-muted); font-size: 11px; font-weight: 700; padding: 6px; border-radius: 7px; cursor: pointer; }
+        .ct-calendar-today-btn:hover { color: var(--text); border-color: var(--text-faint); }
         .ct-owner-select { display: flex; gap: 6px; flex-wrap: wrap; }
         .ct-owner-opt { padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elevated); color: var(--text-muted); font-size: 11.5px; font-weight: 700; cursor: pointer; }
         .ct-owner-opt.active { color: var(--bg); }
@@ -751,7 +841,20 @@ export default function Home() {
                 <input type="number" step="0.01" min="0" value={form.purchasePrice} onChange={(e) => setForm((f) => ({ ...f, purchasePrice: e.target.value }))} placeholder="165.00" />
                 <span className="ct-field-hint">Enter this in the stock's own trading currency{quotes[form.ticker.trim().toUpperCase()]?.currency ? ` (${quotes[form.ticker.trim().toUpperCase()].currency})` : ''}</span>
               </div>
-              <div className="ct-field"><label>Date bought</label><input type="date" value={form.dateBought} onChange={(e) => setForm((f) => ({ ...f, dateBought: e.target.value }))} /></div>
+              <div className="ct-field" style={{ position: 'relative' }} ref={dateFieldRef}>
+                <label>Date bought</label>
+                <button type="button" className="ct-date-trigger" onClick={() => setShowCalendar((s) => !s)}>
+                  <CalendarIcon size={14} />
+                  {formatDateDisplay(form.dateBought)}
+                </button>
+                {showCalendar && (
+                  <CalendarPopover
+                    value={form.dateBought}
+                    onChange={(dateStr) => setForm((f) => ({ ...f, dateBought: dateStr }))}
+                    onClose={() => setShowCalendar(false)}
+                  />
+                )}
+              </div>
               <div className="ct-field">
                 <label>Owner(s) — select one or more</label>
                 <div className="ct-owner-select">
