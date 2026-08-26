@@ -19,6 +19,7 @@ const fmtMoney = (n, currency = 'USD', decimals = 2) => {
 };
 const fmtPct = (n) => `${n >= 0 ? '+' : ''}${(n ?? 0).toFixed(2)}%`;
 const normalizeTicker = (raw) => raw.trim().toUpperCase().replace(/\s+/g, '-');
+const parseNum = (raw) => parseFloat(String(raw ?? '').trim().replace(',', '.'));
 
 const DISPLAY_CURRENCIES = ['USD', 'SEK', 'EUR', 'DKK', 'NOK', 'GBP', 'JPY'];
 
@@ -533,8 +534,8 @@ export default function Home() {
     if (e && e.preventDefault) e.preventDefault();
     const ticker = normalizeTicker(form.ticker);
     const company = form.company.trim() || ticker;
-    const shares = parseFloat(form.shares);
-    const purchasePrice = parseFloat(form.purchasePrice);
+    const shares = parseNum(form.shares);
+    const purchasePrice = parseNum(form.purchasePrice);
 
     if (!ticker) return setAddError('Enter a ticker symbol.');
     if (!shares || shares <= 0) return setAddError('Enter a number of shares greater than 0.');
@@ -569,8 +570,8 @@ export default function Home() {
 
   const confirmSell = () => {
     if (!sellForm) return;
-    const sharesToSell = parseFloat(sellForm.shares);
-    const sellPrice = parseFloat(sellForm.price);
+    const sharesToSell = parseNum(sellForm.shares);
+    const sellPrice = parseNum(sellForm.price);
     if (!sharesToSell || sharesToSell <= 0) return setSellError('Enter a number of shares greater than 0.');
     if (sharesToSell > sellForm.maxShares + 0.0001) return setSellError(`You only hold ${sellForm.maxShares} shares of this.`);
     if (!sellPrice || sellPrice <= 0) return setSellError('Enter a sale price greater than 0.');
@@ -620,7 +621,7 @@ export default function Home() {
   const addDividend = () => {
     const ticker = divForm.ticker;
     if (!ticker) return setDivError('Select which stock this dividend was from.');
-    const amount = parseFloat(divForm.amount);
+    const amount = parseNum(divForm.amount);
     if (!amount || amount <= 0) return setDivError('Enter an amount greater than 0.');
     if (divForm.ownerIds.length === 0) return setDivError('Select at least one owner.');
     setDivError('');
@@ -742,7 +743,7 @@ export default function Home() {
         .ct-expand-btn:hover { color: var(--text); }
         .ct-lot-subrow { display: grid; grid-template-columns: 90px 70px 100px 1fr 30px; gap: 10px; align-items: center; padding: 8px 18px 8px 34px; border-bottom: 1px solid var(--border); background: var(--bg-elevated); font-size: 11.5px; }
         .ct-sell-form-row { padding: 14px 18px; background: var(--bg-elevated); border-bottom: 1px solid var(--border); }
-        .ct-sell-form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+        .ct-sell-form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px; align-items: start; }
         .ct-sell-form-row .ct-add-btn { width: auto; padding: 9px 18px; }
         .ct-sold-head { display: grid; grid-template-columns: 2fr 1.1fr 0.7fr 1fr 1fr 1fr 1.1fr 34px; gap: 8px; padding: 12px 18px; font-size: 10.5px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; border-bottom: 1px solid var(--border); }
         .ct-sold-row { display: grid; grid-template-columns: 2fr 1.1fr 0.7fr 1fr 1fr 1fr 1.1fr 34px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
@@ -752,7 +753,7 @@ export default function Home() {
         .ct-div-row { display: grid; grid-template-columns: 2fr 1.3fr 1.2fr 1fr 34px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
         .ct-div-row:hover { background: var(--surface-hover); }
         .ct-div-form-row { padding: 16px 18px; background: var(--bg-elevated); }
-        .ct-div-form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1.4fr; gap: 10px; margin-bottom: 12px; }
+        .ct-div-form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1.4fr; gap: 10px; margin-bottom: 12px; align-items: start; }
         @media (max-width: 900px) { .ct-div-form-grid { grid-template-columns: 1fr 1fr; } }
         .ct-empty { padding: 40px 20px; text-align: center; color: var(--text-faint); font-size: 13px; }
         .ct-form-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
@@ -765,7 +766,7 @@ export default function Home() {
         .ct-suggest-item:hover { background: var(--surface-hover); }
         .ct-suggest-ticker { font-family: 'IBM Plex Mono', monospace; font-weight: 600; }
         .ct-suggest-company { color: var(--text-faint); }
-        .ct-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+        .ct-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; align-items: start; }
         .ct-field { display: flex; flex-direction: column; gap: 5px; }
         .ct-field label { font-size: 10.5px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; }
         .ct-field input { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-size: 13px; outline: none; }
