@@ -75,7 +75,14 @@ async function fetchYahooChart(ticker) {
     .filter((p) => p.close != null);
 
   const price = meta.regularMarketPrice ?? null;
-  const prevClose = meta.previousClose ?? meta.chartPreviousClose ?? price;
+  // Yahoo's `previousClose` metadata field is known to be occasionally stale
+  // or inconsistent on this endpoint. Prefer the last full trading day's
+  // close from the actual price history we already have — self-consistent
+  // with the numbers we're already showing, rather than a separate field.
+  const todayStr = toDateStr(new Date());
+  const priorCloses = history.filter((p) => toDateStr(new Date(p.date)) !== todayStr);
+  const derivedPrevClose = priorCloses.length > 0 ? priorCloses[priorCloses.length - 1].close : null;
+  const prevClose = derivedPrevClose ?? meta.previousClose ?? meta.chartPreviousClose ?? price;
   const change = price != null && prevClose != null ? price - prevClose : 0;
   const changePercent = prevClose ? (change / prevClose) * 100 : 0;
 
