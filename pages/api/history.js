@@ -1,7 +1,7 @@
-// GET /api/history?ticker=AAPL
+// GET /api/history?ticker=AAPL&days=90 (or days=all for full history)
 // Uses Stooq's free daily CSV feed — no API key needed.
 export default async function handler(req, res) {
-  const { ticker } = req.query;
+  const { ticker, days } = req.query;
   if (!ticker) return res.status(400).json({ error: 'Missing ticker query param' });
 
   try {
@@ -15,13 +15,17 @@ export default async function handler(req, res) {
     }
 
     const rows = text.trim().split('\n').slice(1); // drop header row
-    const points = rows
+    let points = rows
       .map((line) => {
         const [date, , , , close] = line.split(',');
         return { date, close: parseFloat(close) };
       })
-      .filter((p) => p.date && !Number.isNaN(p.close))
-      .slice(-30);
+      .filter((p) => p.date && !Number.isNaN(p.close));
+
+    if (days !== 'all') {
+      const n = parseInt(days, 10);
+      points = points.slice(-(Number.isFinite(n) && n > 0 ? n : 30));
+    }
 
     res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
     res.status(200).json(points);

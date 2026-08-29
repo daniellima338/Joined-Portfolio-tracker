@@ -23,6 +23,11 @@ const parseNum = (raw) => parseFloat(String(raw ?? '').trim().replace(',', '.'))
 
 const DISPLAY_CURRENCIES = ['USD', 'SEK', 'EUR', 'DKK', 'NOK', 'GBP', 'JPY'];
 
+const GROWTH_PERIODS = ['1W', '1M', '3M', '6M', '1Y', 'ALL'];
+const PERIOD_DAYS = { '1W': '7', '1M': '30', '3M': '90', '6M': '182', '1Y': '365', ALL: 'all' };
+const PERIOD_YAHOO_RANGE = { '1W': '5d', '1M': '1mo', '3M': '3mo', '6M': '6mo', '1Y': '1y', ALL: 'max' };
+const PERIOD_LABELS = { '1W': 'the last week', '1M': 'the last 30 days', '3M': 'the last 3 months', '6M': 'the last 6 months', '1Y': 'the last year', ALL: 'all time' };
+
 let idCounter = 1000;
 const nextId = () => idCounter++;
 
@@ -61,8 +66,8 @@ async function fetchJsonWithFallback(url) {
   }
 }
 
-async function fetchYahooChart(ticker) {
-  const url = `${YAHOO_CHART_BASE}${encodeURIComponent(ticker)}?interval=1d&range=1mo`;
+async function fetchYahooChart(ticker, range = '1mo') {
+  const url = `${YAHOO_CHART_BASE}${encodeURIComponent(ticker)}?interval=1d&range=${range}`;
   const data = await fetchJsonWithFallback(url);
   const result = data?.chart?.result?.[0];
   if (!result) throw new Error(data?.chart?.error?.description || `No data for ${ticker}`);
@@ -90,6 +95,25 @@ async function fetchYahooChart(ticker) {
     quote: { price, change, changePercent, currency: meta.currency || 'USD', shortName: meta.symbol || ticker, source: 'yahoo' },
     history,
   };
+}
+
+// Fetches daily closes for one ticker over a given period. Tries Stooq
+// (server-side, US-only) first since it's cheaper/faster, then falls back
+// to the same direct-from-browser Yahoo path used for prices.
+async function fetchHistoryFor(ticker, period) {
+  try {
+    const res = await fetch(`/api/history?ticker=${encodeURIComponent(ticker)}&days=${PERIOD_DAYS[period]}`);
+    if (res.ok) {
+      const points = await res.json();
+      if (points.length > 0) return points;
+    }
+  } catch { /* fall through to Yahoo */ }
+  try {
+    const { history } = await fetchYahooChart(ticker, PERIOD_YAHOO_RANGE[period]);
+    return history;
+  } catch {
+    return [];
+  }
 }
 
 const toDateStr = (date) => {
@@ -258,10 +282,11 @@ export default function Home() {
 
 
   const [quotes, setQuotes] = useState({});
-  const [historyByTicker, setHistoryByTicker] = useState({});
+  const [historyByTicker, setHistoryByTicker] = useState({}); // keyed `${ticker}__${period}`
   const [quotesLoading, setQuotesLoading] = useState(true);
   const [unavailableTickers, setUnavailableTickers] = useState([]);
   const [lastFetched, setLastFetched] = useState(null);
+  const [growthPeriod, setGrowthPeriod] = useState('1M');
 
   const uniqueTickers = useMemo(() => [...new Set(lots.map((l) => l.ticker))], [lots]);
   const tickerKey = uniqueTickers.join(',');
@@ -288,23 +313,11 @@ export default function Home() {
 
     await Promise.all(missing.map(async (ticker) => {
       try {
-        const { quote, history } = await fetchYahooChart(ticker);
+        const { quote } = await fetchYahooChart(ticker);
         setQuotes((prev) => ({ ...prev, [ticker]: quote }));
-        if (history.length > 0) setHistoryByTicker((prev) => ({ ...prev, [ticker]: history }));
       } catch {
         stillUnavailable.push(ticker);
       }
-    }));
-
-    // For Finnhub-covered tickers, also grab 30-day history (Stooq) if we don't have it yet
-    const finnhubTickers = Object.keys(finnhubQuotes);
-    await Promise.all(finnhubTickers.map(async (ticker) => {
-      if (historyByTicker[ticker]) return;
-      try {
-        const res = await fetch(`/api/history?ticker=${encodeURIComponent(ticker)}`);
-        const points = await res.json();
-        if (res.ok && points.length > 0) setHistoryByTicker((prev) => ({ ...prev, [ticker]: points }));
-      } catch { /* chart just won't include this ticker */ }
     }));
 
     setUnavailableTickers(stillUnavailable);
@@ -319,6 +332,25 @@ export default function Home() {
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tickerKey]);
+
+  // History for the growth chart is fetched per-period (not on the 30s quote
+  // clock) and cached per ticker+period, so switching periods back and forth
+  // doesn't re-fetch what's already been loaded.
+  useEffect(() => {
+    if (uniqueTickers.length === 0) return;
+    let cancelled = false;
+    const tickers = uniqueTickers.filter((t) => !manualPricesRef.current[t]);
+    tickers.forEach(async (ticker) => {
+      const key = `${ticker}__${growthPeriod}`;
+      if (historyByTicker[key]) return;
+      const points = await fetchHistoryFor(ticker, growthPeriod);
+      if (!cancelled && points.length > 0) {
+        setHistoryByTicker((prev) => (prev[key] ? prev : { ...prev, [key]: points }));
+      }
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tickerKey, growthPeriod]);
 
   const ownersById = useMemo(() => {
     const map = {};
@@ -453,13 +485,13 @@ export default function Home() {
   const chartData = useMemo(() => {
     let refTicker = null, refLen = 0;
     uniqueTickers.forEach((t) => {
-      const h = historyByTicker[t];
+      const h = historyByTicker[`${t}__${growthPeriod}`];
       if (h && h.length > refLen) { refLen = h.length; refTicker = t; }
     });
     if (!refTicker) return [];
 
     const closeOnOrBefore = (ticker, dateStr) => {
-      const h = historyByTicker[ticker];
+      const h = historyByTicker[`${ticker}__${growthPeriod}`];
       if (!h || h.length === 0) return quotes[ticker]?.price ?? null;
       let result = h[0].close;
       for (const p of h) {
@@ -471,7 +503,10 @@ export default function Home() {
     // Historical closes are in each ticker's native currency; converted using
     // TODAY's FX rate throughout (exact historical FX would be overkill here —
     // same kind of approximation as assuming today's share counts).
-    return historyByTicker[refTicker].map((point) => {
+    const labelOpts = (growthPeriod === '1Y' || growthPeriod === 'ALL')
+      ? { month: 'short', year: '2-digit' }
+      : { month: 'short', day: 'numeric' };
+    return historyByTicker[`${refTicker}__${growthPeriod}`].map((point) => {
       let totalUSD = 0;
       lots.forEach((l) => {
         if (!l.ownerIds.some((oid) => selectedOwnerIds.includes(oid))) return;
@@ -480,11 +515,11 @@ export default function Home() {
         if (close != null) totalUSD += toUSD(l.shares * close, currency);
       });
       return {
-        label: new Date(point.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+        label: new Date(point.date).toLocaleDateString('en-US', labelOpts),
         value: Math.round(fromUSD(totalUSD, displayCurrency) * 100) / 100,
       };
     });
-  }, [historyByTicker, lots, selectedOwnerIds, quotes, tickerKey, displayCurrency, fxRates]);
+  }, [historyByTicker, lots, selectedOwnerIds, quotes, tickerKey, displayCurrency, fxRates, growthPeriod]);
 
   const filterLabel = isAllSelected
     ? 'Everyone, combined'
@@ -713,6 +748,25 @@ export default function Home() {
     [dividendsEnriched]
   );
 
+  // Same-ticker dividend payments merge into one row with a running total,
+  // mirroring how Holdings merges same-ticker lots. Underlying payments stay
+  // individually deletable via the ×N expand control.
+  const groupedDividends = useMemo(() => {
+    const byTicker = {};
+    dividendsEnriched.forEach((d) => {
+      if (!byTicker[d.ticker]) {
+        byTicker[d.ticker] = { ticker: d.ticker, company: d.company, amountDisplay: 0, ownerIds: [], divIds: [], latestDate: d.payDate };
+      }
+      const g = byTicker[d.ticker];
+      g.amountDisplay += d.amountDisplay;
+      g.divIds.push(d.id);
+      if (d.payDate > g.latestDate) g.latestDate = d.payDate;
+      d.ownerIds.forEach((oid) => { if (!g.ownerIds.includes(oid)) g.ownerIds.push(oid); });
+    });
+    return Object.values(byTicker).sort((a, b) => (a.latestDate < b.latestDate ? 1 : -1));
+  }, [dividendsEnriched]);
+  const [expandedDivTicker, setExpandedDivTicker] = useState(null);
+
   const totalReturnDisplay = totalGainAbs + totalRealizedDisplay + totalDividendsDisplay;
 
 
@@ -812,6 +866,7 @@ export default function Home() {
         .ct-div-head { display: grid; grid-template-columns: 2fr 1.3fr 1.2fr 1fr 34px; gap: 8px; padding: 12px 18px; font-size: 10.5px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; border-bottom: 1px solid var(--border); }
         .ct-div-row { display: grid; grid-template-columns: 2fr 1.3fr 1.2fr 1fr 34px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
         .ct-div-row:hover { background: var(--surface-hover); }
+        .ct-div-subrow { display: grid; grid-template-columns: 100px 110px 1fr 30px; gap: 10px; align-items: center; padding: 8px 18px 8px 34px; border-bottom: 1px solid var(--border); background: var(--bg-elevated); font-size: 11.5px; }
         .ct-div-form-row { padding: 16px 18px; background: var(--bg-elevated); }
         .ct-div-form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1.4fr; gap: 10px; margin-bottom: 12px; align-items: start; }
         @media (max-width: 900px) { .ct-div-form-grid { grid-template-columns: 1fr 1fr; } }
@@ -884,7 +939,7 @@ export default function Home() {
           }
           .ct-mobile-label { display: inline; color: var(--text-faint); font-family: 'Inter'; font-weight: 700; text-transform: uppercase; font-size: 9px; letter-spacing: 0.04em; }
 
-          .ct-lot-subrow { grid-template-columns: 1fr; row-gap: 4px; padding: 10px 16px 10px 28px; }
+          .ct-lot-subrow, .ct-div-subrow { grid-template-columns: 1fr; row-gap: 4px; padding: 10px 16px 10px 28px; }
           .ct-sell-form-grid, .ct-div-form-grid, .ct-form-grid { grid-template-columns: 1fr; }
         }
       `}</style>
@@ -964,8 +1019,17 @@ export default function Home() {
 
         <div className="ct-main-grid">
           <div className="ct-card">
-            <div className="ct-panel-title">Growth over the last 30 days</div>
-            <div className="ct-panel-sub">Real historical closes · assumes today's share counts · {filterLabel}</div>
+            <div className="ct-panel-head">
+              <div>
+                <div className="ct-panel-title">Growth over {PERIOD_LABELS[growthPeriod]}</div>
+                <div className="ct-panel-sub">Real historical closes · assumes today's share counts · {filterLabel}</div>
+              </div>
+              <div className="ct-donut-toggle">
+                {GROWTH_PERIODS.map((p) => (
+                  <button key={p} className={growthPeriod === p ? 'active' : ''} onClick={() => setGrowthPeriod(p)}>{p}</button>
+                ))}
+              </div>
+            </div>
             <ResponsiveContainer width="100%" height={230}>
               <AreaChart data={chartData} margin={{ top: 4, right: 6, left: -18, bottom: 0 }}>
                 <defs>
@@ -975,7 +1039,7 @@ export default function Home() {
                   </linearGradient>
                 </defs>
                 <CartesianGrid stroke="#262E3A" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: '#59626F', fontSize: 10.5, fontFamily: 'IBM Plex Mono' }} interval={4} axisLine={{ stroke: '#262E3A' }} tickLine={false} />
+                <XAxis dataKey="label" tick={{ fill: '#59626F', fontSize: 10.5, fontFamily: 'IBM Plex Mono' }} interval={Math.max(0, Math.floor((chartData.length - 1) / 6))} axisLine={{ stroke: '#262E3A' }} tickLine={false} />
                 <YAxis tick={{ fill: '#59626F', fontSize: 10.5, fontFamily: 'IBM Plex Mono' }} axisLine={false} tickLine={false} width={54} tickFormatter={(v) => `$${Math.round(v / 1000)}k`} />
                 <Tooltip content={({ active, payload, label }) => active && payload && payload.length ? (
                   <div className="ct-tooltip"><div style={{ color: '#8992A3', marginBottom: 2 }}>{label}</div><div style={{ color: '#E7E9ED', fontWeight: 600 }}>{fmtMoney(payload[0].value, displayCurrency, 0)}</div></div>
@@ -1173,31 +1237,55 @@ export default function Home() {
 
         <div className="ct-section-title">Dividends</div>
         <div className="ct-section-sub">
-          {filterLabel} · logged by hand, since only you know exactly what landed in the account · total received: <span className="pos">+{fmtMoney(totalDividendsDisplay, displayCurrency, 0)}</span>
+          {filterLabel} · logged by hand, since only you know exactly what landed in the account · same ticker's payments merge into one row with a running total · click ×N to see and manage individual payments · total received: <span className="pos">+{fmtMoney(totalDividendsDisplay, displayCurrency, 0)}</span>
           {(sales.length > 0 || totalDividendsDisplay !== 0) && (
             <> · total return incl. dividends &amp; realized gains: <span className={totalReturnDisplay >= 0 ? 'pos' : 'neg'}>{totalReturnDisplay >= 0 ? '+' : ''}{fmtMoney(totalReturnDisplay, displayCurrency, 0)}</span></>
           )}
         </div>
         <div className="ct-ledger" style={{ marginBottom: 22 }}>
-          {dividendsEnriched.length === 0 && <div className="ct-empty">No dividends logged yet — add one below when a payment lands.</div>}
-          {dividendsEnriched.length > 0 && (
+          {groupedDividends.length === 0 && <div className="ct-empty">No dividends logged yet — add one below when a payment lands.</div>}
+          {groupedDividends.length > 0 && (
             <div className="ct-div-head"><div>Asset</div><div>Owner</div><div>Amount</div><div>Date</div><div /></div>
           )}
-          {dividendsEnriched.map((d) => (
-            <div className="ct-div-row" key={d.id}>
-              <div className="ct-cell-asset ct-asset-name">
-                <span className="ct-asset-ticker">{d.ticker}</span>
-                <span className="ct-asset-company">{d.company}</span>
+          {groupedDividends.map((g) => (
+            <React.Fragment key={g.ticker}>
+              <div className="ct-div-row">
+                <div className="ct-cell-asset ct-asset-name">
+                  <span className="ct-asset-ticker">{g.ticker}</span>
+                  <span className="ct-asset-company">{g.company}</span>
+                </div>
+                <div className="ct-cell-owner ct-owner-pills">
+                  {g.ownerIds.map((oid) => ownersById[oid] ? (
+                    <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
+                  ) : null)}
+                </div>
+                <span className="ct-cell-amount ct-mono pos">+{fmtMoney(g.amountDisplay, displayCurrency)}</span>
+                <span className="ct-cell-date ct-mono">{g.divIds.length > 1 ? `${g.divIds.length}× · latest ${g.latestDate}` : g.latestDate}</span>
+                <div className="ct-cell-actions">
+                  {g.divIds.length === 1 ? (
+                    <button className="ct-remove-btn" onClick={() => removeDividend(g.divIds[0])} title="Delete this dividend record"><X size={14} /></button>
+                  ) : (
+                    <button className="ct-expand-btn" onClick={() => setExpandedDivTicker(expandedDivTicker === g.ticker ? null : g.ticker)}>
+                      ×{g.divIds.length} {expandedDivTicker === g.ticker ? '▲' : '▼'}
+                    </button>
+                  )}
+                </div>
               </div>
-              <div className="ct-cell-owner ct-owner-pills">
-                {d.ownerIds.map((oid) => ownersById[oid] ? (
-                  <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
-                ) : null)}
-              </div>
-              <span className="ct-cell-amount ct-mono pos">+{fmtMoney(d.amount, d.currency)}</span>
-              <span className="ct-cell-date ct-mono">{d.payDate}</span>
-              <button className="ct-cell-actions ct-remove-btn" onClick={() => removeDividend(d.id)} title="Delete this dividend record"><X size={14} /></button>
-            </div>
+              {expandedDivTicker === g.ticker && dividendsEnriched
+                .filter((d) => d.ticker === g.ticker)
+                .map((d) => (
+                  <div className="ct-div-subrow" key={d.id}>
+                    <span className="ct-mono">{d.payDate}</span>
+                    <span className="ct-mono pos">+{fmtMoney(d.amount, d.currency)}</span>
+                    <div className="ct-owner-pills">
+                      {d.ownerIds.map((oid) => ownersById[oid] ? (
+                        <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
+                      ) : null)}
+                    </div>
+                    <button className="ct-remove-btn" onClick={() => removeDividend(d.id)} title="Delete this individual payment"><X size={13} /></button>
+                  </div>
+                ))}
+            </React.Fragment>
           ))}
           <div className="ct-div-form-row">
             <div className="ct-div-form-grid">
