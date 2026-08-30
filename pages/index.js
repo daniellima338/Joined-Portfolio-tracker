@@ -28,6 +28,31 @@ const PERIOD_DAYS = { '1W': '7', '1M': '30', '3M': '90', '6M': '182', '1Y': '365
 const PERIOD_YAHOO_RANGE = { '1W': '5d', '1M': '1mo', '3M': '3mo', '6M': '6mo', '1Y': '1y', ALL: 'max' };
 const PERIOD_LABELS = { '1W': 'the last week', '1M': 'the last 30 days', '3M': 'the last 3 months', '6M': 'the last 6 months', '1Y': 'the last year', ALL: 'all time' };
 
+// Buckets Finnhub's free-tier `finnhubIndustry` field (which varies from broad
+// e.g. "Technology" to narrow e.g. "Airlines") into a small set of GICS-like
+// sectors. Anything that doesn't match a keyword falls back to its own raw
+// label rather than being lumped into "Unknown" — only missing/unclassified
+// data (mainly ETFs, and tickers Finnhub has no profile for) becomes Unknown.
+const SECTOR_BUCKETS = [
+  { bucket: 'Technology', keywords: ['technology', 'software', 'semiconductor', 'internet', 'it services', 'electronic', 'hardware'] },
+  { bucket: 'Communication Services', keywords: ['communication', 'telecom', 'media', 'entertainment', 'broadcasting'] },
+  { bucket: 'Financial Services', keywords: ['bank', 'financial', 'insurance', 'capital markets', 'asset management'] },
+  { bucket: 'Healthcare', keywords: ['health', 'pharma', 'biotech', 'medical', 'life sciences'] },
+  { bucket: 'Consumer Discretionary', keywords: ['retail', 'apparel', 'auto', 'leisure', 'hotel', 'restaurant', 'consumer cyclical', 'e-commerce', 'specialty'] },
+  { bucket: 'Consumer Staples', keywords: ['consumer defensive', 'food', 'beverage', 'household', 'personal products', 'tobacco', 'grocery'] },
+  { bucket: 'Industrials', keywords: ['industrial', 'aerospace', 'defense', 'machinery', 'construction', 'transportation', 'airline', 'logistics', 'building'] },
+  { bucket: 'Energy', keywords: ['energy', 'oil', 'gas', 'coal'] },
+  { bucket: 'Utilities', keywords: ['utilit'] },
+  { bucket: 'Basic Materials', keywords: ['material', 'chemical', 'metal', 'mining', 'steel', 'paper', 'forestry'] },
+  { bucket: 'Real Estate', keywords: ['real estate', 'reit'] },
+];
+const bucketSector = (industry) => {
+  if (!industry) return 'Unknown';
+  const lower = industry.toLowerCase();
+  const match = SECTOR_BUCKETS.find((b) => b.keywords.some((k) => lower.includes(k)));
+  return match ? match.bucket : industry;
+};
+
 let idCounter = 1000;
 const nextId = () => idCounter++;
 
@@ -201,12 +226,24 @@ export default function Home() {
   const [sales, setSales] = useState([]); // realized sale records — kept separate from active holdings
   const [dividends, setDividends] = useState([]); // manually logged dividend payments
   const [manualPrices, setManualPrices] = useState({}); // { [ticker]: { price, currency, updatedDate } } — user-entered overrides
+  const [etfHoldings, setEtfHoldings] = useState({}); // { [etfTicker]: [{ ticker, company, weightPct }] } — manually entered top holdings, used for sector look-through
   const manualPricesRef = useRef({});
   useEffect(() => { manualPricesRef.current = manualPrices; }, [manualPrices]);
   const [selectedOwnerIds, setSelectedOwnerIds] = useState(() => seedOwners().map((o) => o.id));
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'sectors'
   const [donutBy, setDonutBy] = useState('owner');
   const [showAddOwner, setShowAddOwner] = useState(false);
   const [newOwnerName, setNewOwnerName] = useState('');
+
+  // ---- sectors & underlying (ETF look-through) holdings ----------------
+  const [lookThroughMode, setLookThroughMode] = useState('lookthrough'); // 'direct' | 'lookthrough'
+  const [sectorValueMode, setSectorValueMode] = useState('value'); // 'value' | 'percent'
+  const [expandedSector, setExpandedSector] = useState(null);
+  const [showAllPositions, setShowAllPositions] = useState(false);
+  const [showManageEtf, setShowManageEtf] = useState(false);
+  const [etfEditTicker, setEtfEditTicker] = useState('');
+  const [etfEditRows, setEtfEditRows] = useState([]); // [{ ticker, company, weightPct }] — being edited, not yet saved
+  const [etfEditError, setEtfEditError] = useState('');
 
   // ---- currency: fetch free daily FX rates (base USD), no key needed ----
   const [fxRates, setFxRates] = useState({ USD: 1 });
@@ -253,6 +290,7 @@ export default function Home() {
           setSales(Array.isArray(data.sales) ? data.sales : []);
           setDividends(Array.isArray(data.dividends) ? data.dividends : []);
           setManualPrices(data.manualPrices && typeof data.manualPrices === 'object' ? data.manualPrices : {});
+          setEtfHoldings(data.etfHoldings && typeof data.etfHoldings === 'object' ? data.etfHoldings : {});
           setSelectedOwnerIds(data.owners.map((o) => o.id));
           const allIds = [...data.lots, ...(data.sales || []), ...(data.dividends || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
           idCounter = Math.max(idCounter, ...allIds, 0) + 1;
@@ -272,13 +310,13 @@ export default function Home() {
       fetch('/api/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ owners, lots, sales, dividends, manualPrices }),
+        body: JSON.stringify({ owners, lots, sales, dividends, manualPrices, etfHoldings }),
       })
         .then((res) => setSaveStatus(res.ok ? 'saved' : 'error'))
         .catch(() => setSaveStatus('error'));
     }, 600);
     return () => clearTimeout(t);
-  }, [owners, lots, sales, dividends, manualPrices, hasLoadedState]);
+  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, hasLoadedState]);
 
 
   const [quotes, setQuotes] = useState({});
@@ -351,6 +389,39 @@ export default function Home() {
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tickerKey, growthPeriod]);
+
+  // Sector classification (Finnhub's free /stock/profile2) for both directly
+  // held tickers and any underlying tickers entered via "Manage ETF holdings"
+  // below. Fetched once per ticker and cached for the session — industry
+  // classification doesn't change often enough to warrant a refresh clock.
+  const [sectorByTicker, setSectorByTicker] = useState({}); // { [ticker]: industry string | null }
+  useEffect(() => {
+    const allTickers = new Set(uniqueTickers);
+    Object.values(etfHoldings).forEach((rows) => rows.forEach((h) => allTickers.add(h.ticker)));
+    const missing = [...allTickers].filter((t) => !(t in sectorByTicker));
+    if (missing.length === 0) return;
+    let cancelled = false;
+    fetch(`/api/sector?tickers=${encodeURIComponent(missing.join(','))}`)
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((data) => {
+        if (cancelled) return;
+        setSectorByTicker((prev) => {
+          const next = { ...prev };
+          missing.forEach((t) => { next[t] = data[t] || null; });
+          return next;
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSectorByTicker((prev) => {
+          const next = { ...prev };
+          missing.forEach((t) => { if (!(t in next)) next[t] = null; });
+          return next;
+        });
+      });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tickerKey, etfHoldings]);
 
   const ownersById = useMemo(() => {
     const map = {};
@@ -520,6 +591,53 @@ export default function Home() {
       };
     });
   }, [historyByTicker, lots, selectedOwnerIds, quotes, tickerKey, displayCurrency, fxRates, growthPeriod]);
+
+  // Expands each held ticker into its underlying holdings when we have them
+  // (entered via "Manage ETF holdings"); anything without entered holdings
+  // just passes through as its own position. Partial weight entries (e.g.
+  // top-10 holdings that only add up to 67%) leave the remainder in
+  // `unknownUSD` rather than silently under-counting the ETF's value.
+  const lookThroughPositions = useMemo(() => {
+    const map = {};
+    let unknownUSD = 0;
+    groupedHoldings.forEach((g) => {
+      const holdings = etfHoldings[g.ticker];
+      if (holdings && holdings.length > 0) {
+        const totalWeight = holdings.reduce((s, h) => s + (h.weightPct || 0), 0);
+        holdings.forEach((h) => {
+          if (!map[h.ticker]) map[h.ticker] = { ticker: h.ticker, company: h.company || h.ticker, valueUSD: 0 };
+          map[h.ticker].valueUSD += g.valueUSD * ((h.weightPct || 0) / 100);
+        });
+        unknownUSD += g.valueUSD * (1 - Math.min(totalWeight, 100) / 100);
+      } else {
+        if (!map[g.ticker]) map[g.ticker] = { ticker: g.ticker, company: g.company, valueUSD: 0 };
+        map[g.ticker].valueUSD += g.valueUSD;
+      }
+    });
+    return { positions: Object.values(map), unknownUSD };
+  }, [groupedHoldings, etfHoldings]);
+
+  const sectorViewData = useMemo(() => {
+    const positions = lookThroughMode === 'lookthrough'
+      ? lookThroughPositions.positions
+      : groupedHoldings.map((g) => ({ ticker: g.ticker, company: g.company, valueUSD: g.valueUSD }));
+    const unknownUSD = lookThroughMode === 'lookthrough' ? lookThroughPositions.unknownUSD : 0;
+    const totalUSD = positions.reduce((s, p) => s + p.valueUSD, 0) + unknownUSD;
+
+    const bySector = {};
+    positions.forEach((p) => {
+      const sector = bucketSector(sectorByTicker[p.ticker]);
+      if (!bySector[sector]) bySector[sector] = { sector, valueUSD: 0, items: [] };
+      bySector[sector].valueUSD += p.valueUSD;
+      bySector[sector].items.push(p);
+    });
+    const groups = Object.values(bySector)
+      .map((g) => ({ ...g, items: g.items.sort((a, b) => b.valueUSD - a.valueUSD) }))
+      .sort((a, b) => b.valueUSD - a.valueUSD);
+    const sortedPositions = [...positions].sort((a, b) => b.valueUSD - a.valueUSD);
+
+    return { positions: sortedPositions, groups, unknownUSD, totalUSD };
+  }, [lookThroughMode, lookThroughPositions, groupedHoldings, sectorByTicker]);
 
   const filterLabel = isAllSelected
     ? 'Everyone, combined'
@@ -699,6 +817,28 @@ export default function Home() {
     setManualPrices((prev) => { const next = { ...prev }; delete next[ticker]; return next; });
   };
 
+  const selectEtfToEdit = (ticker) => {
+    setEtfEditTicker(ticker);
+    setEtfEditRows(ticker && etfHoldings[ticker] ? etfHoldings[ticker].map((h) => ({ ...h })) : []);
+    setEtfEditError('');
+  };
+  const addEtfRow = () => setEtfEditRows((prev) => [...prev, { ticker: '', company: '', weightPct: '' }]);
+  const updateEtfRow = (i, field, value) => setEtfEditRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, [field]: value } : r)));
+  const removeEtfRow = (i) => setEtfEditRows((prev) => prev.filter((_, idx) => idx !== i));
+  const saveEtfHoldings = () => {
+    if (!etfEditTicker) return;
+    const rows = etfEditRows
+      .map((r) => ({ ticker: normalizeTicker(r.ticker || ''), company: (r.company || '').trim(), weightPct: parseNum(r.weightPct) }))
+      .filter((r) => r.ticker && r.weightPct > 0);
+    if (rows.length === 0) return setEtfEditError('Add at least one holding with a ticker and a weight greater than 0.');
+    setEtfEditError('');
+    setEtfHoldings((prev) => ({ ...prev, [etfEditTicker]: rows }));
+  };
+  const clearEtfHoldings = () => {
+    setEtfHoldings((prev) => { const next = { ...prev }; delete next[etfEditTicker]; return next; });
+    setEtfEditRows([]);
+  };
+
   const knownTickers = useMemo(() => {
     const map = {};
     lots.forEach((l) => { if (!map[l.ticker]) map[l.ticker] = { company: l.company, currency: l.currency }; });
@@ -772,6 +912,7 @@ export default function Home() {
 
 
   const secondsAgo = lastFetched ? Math.floor((Date.now() - lastFetched) / 1000) : null;
+  const visiblePositions = showAllPositions ? sectorViewData.positions : sectorViewData.positions.slice(0, 10);
 
   return (
     <div className="ct-root">
@@ -818,6 +959,18 @@ export default function Home() {
         .pos { color: var(--pos); } .neg { color: var(--neg); }
         .ct-main-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 14px; margin-bottom: 22px; }
         @media (max-width: 900px) { .ct-main-grid { grid-template-columns: 1fr; } }
+        .ct-sector-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin-top: 8px; }
+        @media (max-width: 900px) { .ct-sector-grid { grid-template-columns: 1fr; } }
+        .ct-bar-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+        .ct-bar-row { display: grid; grid-template-columns: 64px 1fr 84px; gap: 10px; align-items: center; font-size: 12px; }
+        .ct-bar-track { height: 7px; border-radius: 4px; background: var(--bg-elevated); overflow: hidden; }
+        .ct-bar-fill { height: 100%; background: var(--gold); border-radius: 4px; }
+        .ct-bar-val { text-align: right; }
+        .ct-sector-row { display: flex; justify-content: space-between; align-items: center; padding: 11px 0; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 13px; }
+        .ct-sector-row:hover { color: var(--gold); }
+        .ct-sector-subrow { display: flex; justify-content: space-between; padding: 7px 0 7px 16px; font-size: 11.5px; color: var(--text-muted); border-bottom: 1px dashed var(--border); }
+        .ct-inline-input { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; color: var(--text); font-size: 12.5px; outline: none; width: 100%; }
+        .ct-inline-input:focus { border-color: var(--gold); }
         .ct-panel-title { font-family: 'Fraunces', serif; font-size: 16px; font-weight: 500; margin: 0 0 2px; }
         .ct-panel-sub { color: var(--text-faint); font-size: 11.5px; margin-bottom: 14px; }
         .ct-panel-head { display: flex; justify-content: space-between; align-items: flex-start; }
@@ -941,6 +1094,8 @@ export default function Home() {
 
           .ct-lot-subrow, .ct-div-subrow { grid-template-columns: 1fr; row-gap: 4px; padding: 10px 16px 10px 28px; }
           .ct-sell-form-grid, .ct-div-form-grid, .ct-form-grid { grid-template-columns: 1fr; }
+          .ct-etf-row-grid { grid-template-columns: 1fr 1fr !important; }
+          .ct-bar-row { grid-template-columns: 50px 1fr 66px; }
         }
       `}</style>
 
@@ -963,6 +1118,11 @@ export default function Home() {
           </div>
         </div>
         <div className="ct-fx-caption">Values shown in {displayCurrency} · each holding's own price stays in its actual trading currency</div>
+
+        <div className="ct-tabs" style={{ marginBottom: 18 }}>
+          <button className={`ct-tab ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>Dashboard</button>
+          <button className={`ct-tab ${activeTab === 'sectors' ? 'active' : ''}`} onClick={() => setActiveTab('sectors')}>Sectors</button>
+        </div>
 
         <div className="ct-tabs-row">
           <div className="ct-tabs">
@@ -990,6 +1150,8 @@ export default function Home() {
         </div>
         <div className="ct-filter-caption">Viewing: {filterLabel} — holdings are summed together, never averaged</div>
 
+        {activeTab === 'dashboard' && (
+        <>
         <div className="ct-metrics">
           <div className="ct-card">
             <div className="ct-card-label">Total Portfolio Value</div>
@@ -1430,6 +1592,129 @@ export default function Home() {
             {addError && <div className="ct-field-hint" style={{ textAlign: 'center', marginTop: 8, color: 'var(--neg)' }}>{addError}</div>}
           </div>
         </div>
+        </>
+        )}
+
+        {activeTab === 'sectors' && (
+        <div className="ct-card" style={{ marginBottom: 22 }}>
+          <div className="ct-panel-head">
+            <div>
+              <div className="ct-panel-title">Sectors &amp; underlying holdings</div>
+              <div className="ct-panel-sub">
+                {lookThroughMode === 'lookthrough' ? "Look-through — ETFs you've entered holdings for are broken into their underlying stocks" : 'Direct holdings only — ETFs shown as a single line'} · {filterLabel}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <div className="ct-donut-toggle">
+                <button className={lookThroughMode === 'direct' ? 'active' : ''} onClick={() => setLookThroughMode('direct')}>Direct</button>
+                <button className={lookThroughMode === 'lookthrough' ? 'active' : ''} onClick={() => setLookThroughMode('lookthrough')}>Look-through</button>
+              </div>
+              <div className="ct-donut-toggle">
+                <button className={sectorValueMode === 'value' ? 'active' : ''} onClick={() => setSectorValueMode('value')}>{displayCurrency}</button>
+                <button className={sectorValueMode === 'percent' ? 'active' : ''} onClick={() => setSectorValueMode('percent')}>%</button>
+              </div>
+              <button type="button" className="ct-add-owner-btn" onClick={() => { setShowManageEtf((s) => !s); if (showManageEtf) selectEtfToEdit(''); }}>
+                {showManageEtf ? 'Close' : 'Manage ETF holdings'}
+              </button>
+            </div>
+          </div>
+
+          {showManageEtf && (
+            <div className="ct-sell-form-row" style={{ marginTop: 14, marginBottom: 4 }}>
+              <div className="ct-field" style={{ marginBottom: 12 }}>
+                <label>ETF / fund to enter holdings for</label>
+                <select className="ct-currency-select" style={{ width: '100%' }} value={etfEditTicker} onChange={(e) => selectEtfToEdit(e.target.value)}>
+                  <option value="">Select a holding…</option>
+                  {uniqueTickers.map((t) => (
+                    <option key={t} value={t}>{t}{etfHoldings[t] ? ` — ${etfHoldings[t].length} holdings entered` : ''}</option>
+                  ))}
+                </select>
+              </div>
+
+              {etfEditTicker && (
+                <>
+                  {etfEditRows.map((row, i) => (
+                    <div key={i} className="ct-etf-row-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr 90px 30px', gap: 8, marginBottom: 8, alignItems: 'center' }}>
+                      <input className="ct-inline-input" placeholder="Ticker" value={row.ticker} onChange={(e) => updateEtfRow(i, 'ticker', normalizeTicker(e.target.value))} />
+                      <input className="ct-inline-input" placeholder="Company (optional)" value={row.company} onChange={(e) => updateEtfRow(i, 'company', e.target.value)} />
+                      <input className="ct-inline-input" type="number" step="0.01" min="0" placeholder="%" value={row.weightPct} onChange={(e) => updateEtfRow(i, 'weightPct', e.target.value)} />
+                      <button type="button" className="ct-remove-btn" onClick={() => removeEtfRow(i)}><X size={14} /></button>
+                    </div>
+                  ))}
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 4 }}>
+                    <button type="button" className="ct-sell-btn" onClick={addEtfRow}>+ Add holding</button>
+                    <button type="button" className="ct-add-btn" style={{ width: 'auto', padding: '9px 18px' }} onClick={saveEtfHoldings}>Save</button>
+                    {etfHoldings[etfEditTicker] && <button type="button" className="ct-cancel-owner-btn" onClick={clearEtfHoldings}>Clear all</button>}
+                  </div>
+                  <div className="ct-field-hint" style={{ marginTop: 8 }}>
+                    Total allocated: {etfEditRows.reduce((s, r) => s + (parseNum(r.weightPct) || 0), 0).toFixed(1)}% — the rest counts as "Unknown" in the breakdown below
+                  </div>
+                  {etfEditError && <div className="ct-field-hint" style={{ color: 'var(--neg)', marginTop: 6 }}>{etfEditError}</div>}
+                </>
+              )}
+            </div>
+          )}
+
+          <div className="ct-sector-grid">
+            <div>
+              <div className="ct-panel-sub" style={{ marginTop: 12 }}>Underlying holdings{lookThroughMode === 'lookthrough' ? ' (look-through)' : ''}</div>
+              <div className="ct-bar-list">
+                {visiblePositions.map((p) => {
+                  const pct = sectorViewData.totalUSD > 0 ? (p.valueUSD / sectorViewData.totalUSD) * 100 : 0;
+                  return (
+                    <div className="ct-bar-row" key={p.ticker}>
+                      <span className="ct-mono">{p.ticker}</span>
+                      <div className="ct-bar-track"><div className="ct-bar-fill" style={{ width: `${Math.min(100, pct)}%` }} /></div>
+                      <span className="ct-mono ct-bar-val">{sectorValueMode === 'value' ? fmtMoney(fromUSD(p.valueUSD, displayCurrency), displayCurrency, 0) : `${pct.toFixed(1)}%`}</span>
+                    </div>
+                  );
+                })}
+                {sectorViewData.positions.length === 0 && <div style={{ color: 'var(--text-faint)', fontSize: 12 }}>Nothing to show yet</div>}
+              </div>
+              {sectorViewData.positions.length > 10 && (
+                <button type="button" className="ct-expand-btn" style={{ marginTop: 6 }} onClick={() => setShowAllPositions((s) => !s)}>
+                  {showAllPositions ? 'Show fewer ▲' : `Show all ${sectorViewData.positions.length} ▼`}
+                </button>
+              )}
+              {sectorViewData.unknownUSD > 0 && (
+                <div className="ct-field-hint" style={{ marginTop: 10 }}>
+                  Unknown: {fmtMoney(fromUSD(sectorViewData.unknownUSD, displayCurrency), displayCurrency, 0)} ({((sectorViewData.unknownUSD / sectorViewData.totalUSD) * 100).toFixed(0)}% — ETF holdings not yet entered, or entered weights under 100%)
+                </div>
+              )}
+            </div>
+
+            <div>
+              <div className="ct-panel-sub" style={{ marginTop: 12 }}>{sectorViewData.groups.length} sector{sectorViewData.groups.length === 1 ? '' : 's'}</div>
+              {sectorViewData.groups.map((g) => {
+                const pct = sectorViewData.totalUSD > 0 ? (g.valueUSD / sectorViewData.totalUSD) * 100 : 0;
+                return (
+                  <React.Fragment key={g.sector}>
+                    <div className="ct-sector-row" onClick={() => setExpandedSector(expandedSector === g.sector ? null : g.sector)}>
+                      <span>{g.sector}</span>
+                      <span className="ct-mono">{sectorValueMode === 'value' ? fmtMoney(fromUSD(g.valueUSD, displayCurrency), displayCurrency, 0) : `${pct.toFixed(1)}%`} {expandedSector === g.sector ? '▲' : '▼'}</span>
+                    </div>
+                    {expandedSector === g.sector && g.items.map((it) => {
+                      const itPct = sectorViewData.totalUSD > 0 ? (it.valueUSD / sectorViewData.totalUSD) * 100 : 0;
+                      return (
+                        <div className="ct-sector-subrow" key={it.ticker}>
+                          <span className="ct-mono">{it.ticker}</span>
+                          <span className="ct-mono">{sectorValueMode === 'value' ? fmtMoney(fromUSD(it.valueUSD, displayCurrency), displayCurrency, 0) : `${itPct.toFixed(1)}%`}</span>
+                        </div>
+                      );
+                    })}
+                  </React.Fragment>
+                );
+              })}
+              {sectorViewData.groups.length === 0 && <div style={{ color: 'var(--text-faint)', fontSize: 12 }}>Nothing to show yet</div>}
+              {sectorViewData.unknownUSD > 0 && (
+                <div className="ct-field-hint" style={{ marginTop: 10 }}>
+                  Unknown: {fmtMoney(fromUSD(sectorViewData.unknownUSD, displayCurrency), displayCurrency, 0)} ({((sectorViewData.unknownUSD / sectorViewData.totalUSD) * 100).toFixed(0)}%)
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+        )}
 
         <div style={{ color: 'var(--text-faint)', fontSize: 11.5, textAlign: 'center', marginTop: 30 }}>
           Shared between anyone who opens this app — changes save automatically and sync across devices.
