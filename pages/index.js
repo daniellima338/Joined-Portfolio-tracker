@@ -33,11 +33,16 @@ const PERIOD_LABELS = { '1W': 'the last week', '1M': 'the last 30 days', '3M': '
 // sectors. Anything that doesn't match a keyword falls back to its own raw
 // label rather than being lumped into "Unknown" — only missing/unclassified
 // data (mainly ETFs, and tickers Finnhub has no profile for) becomes Unknown.
+// Order matters: checked top-to-bottom, first keyword match wins. Domain-
+// specific buckets are listed before Technology because several providers
+// (Finnhub included) label pharma/biotech/fintech-adjacent industries with
+// compound names like "Health Technology" or "Financial Technology" — if
+// Technology were checked first, "technology" would match before the more
+// correct "health"/"financial" keyword got a chance.
 const SECTOR_BUCKETS = [
-  { bucket: 'Technology', keywords: ['technology', 'software', 'semiconductor', 'internet', 'it services', 'electronic', 'hardware'] },
-  { bucket: 'Communication Services', keywords: ['communication', 'telecom', 'media', 'entertainment', 'broadcasting'] },
-  { bucket: 'Financial Services', keywords: ['bank', 'financial', 'insurance', 'capital markets', 'asset management'] },
   { bucket: 'Healthcare', keywords: ['health', 'pharma', 'biotech', 'medical', 'life sciences'] },
+  { bucket: 'Financial Services', keywords: ['bank', 'financial', 'insurance', 'capital markets', 'asset management'] },
+  { bucket: 'Communication Services', keywords: ['communication', 'telecom', 'media', 'entertainment', 'broadcasting'] },
   { bucket: 'Consumer Discretionary', keywords: ['retail', 'apparel', 'auto', 'leisure', 'hotel', 'restaurant', 'consumer cyclical', 'e-commerce', 'specialty'] },
   { bucket: 'Consumer Staples', keywords: ['consumer defensive', 'food', 'beverage', 'household', 'personal products', 'tobacco', 'grocery'] },
   { bucket: 'Industrials', keywords: ['industrial', 'aerospace', 'defense', 'machinery', 'construction', 'transportation', 'airline', 'logistics', 'building'] },
@@ -45,6 +50,7 @@ const SECTOR_BUCKETS = [
   { bucket: 'Utilities', keywords: ['utilit'] },
   { bucket: 'Basic Materials', keywords: ['material', 'chemical', 'metal', 'mining', 'steel', 'paper', 'forestry'] },
   { bucket: 'Real Estate', keywords: ['real estate', 'reit'] },
+  { bucket: 'Technology', keywords: ['technology', 'software', 'semiconductor', 'internet', 'it services', 'electronic', 'hardware'] },
 ];
 const bucketSector = (industry) => {
   if (!industry) return 'Unknown';
