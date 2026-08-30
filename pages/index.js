@@ -968,13 +968,16 @@ export default function Home() {
         .ct-sector-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin-top: 8px; }
         @media (max-width: 900px) { .ct-sector-grid { grid-template-columns: 1fr; } }
         .ct-bar-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
-        .ct-bar-row { display: grid; grid-template-columns: 64px 1fr 84px; gap: 10px; align-items: center; font-size: 12px; }
+        .ct-bar-row { display: grid; grid-template-columns: 1fr 90px 84px; gap: 10px; align-items: center; font-size: 12px; }
+        .ct-bar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .ct-bar-track { height: 7px; border-radius: 4px; background: var(--bg-elevated); overflow: hidden; }
         .ct-bar-fill { height: 100%; background: var(--gold); border-radius: 4px; }
         .ct-bar-val { text-align: right; }
         .ct-sector-row { display: flex; justify-content: space-between; align-items: center; padding: 11px 0; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 13px; }
         .ct-sector-row:hover { color: var(--gold); }
-        .ct-sector-subrow { display: flex; justify-content: space-between; padding: 7px 0 7px 16px; font-size: 11.5px; color: var(--text-muted); border-bottom: 1px dashed var(--border); }
+        .ct-sector-subrow { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0 7px 16px; font-size: 11.5px; color: var(--text-muted); border-bottom: 1px dashed var(--border); }
+        .ct-sector-subrow-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ct-sector-subrow-val { flex-shrink: 0; }
         .ct-inline-input { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; color: var(--text); font-size: 12.5px; outline: none; width: 100%; }
         .ct-inline-input:focus { border-color: var(--gold); }
         .ct-panel-title { font-family: 'Fraunces', serif; font-size: 16px; font-weight: 500; margin: 0 0 2px; }
@@ -1101,7 +1104,7 @@ export default function Home() {
           .ct-lot-subrow, .ct-div-subrow { grid-template-columns: 1fr; row-gap: 4px; padding: 10px 16px 10px 28px; }
           .ct-sell-form-grid, .ct-div-form-grid, .ct-form-grid { grid-template-columns: 1fr; }
           .ct-etf-row-grid { grid-template-columns: 1fr 1fr !important; }
-          .ct-bar-row { grid-template-columns: 50px 1fr 66px; }
+          .ct-bar-row { grid-template-columns: 1fr 60px 66px; }
         }
       `}</style>
 
@@ -1632,7 +1635,7 @@ export default function Home() {
                 <select className="ct-currency-select" style={{ width: '100%' }} value={etfEditTicker} onChange={(e) => selectEtfToEdit(e.target.value)}>
                   <option value="">Select a holding…</option>
                   {uniqueTickers.map((t) => (
-                    <option key={t} value={t}>{t}{etfHoldings[t] ? ` — ${etfHoldings[t].length} holdings entered` : ''}</option>
+                    <option key={t} value={t}>{knownTickers[t]?.company || t}{etfHoldings[t] ? ` — ${etfHoldings[t].length} holdings entered` : ''}</option>
                   ))}
                 </select>
               </div>
@@ -1669,7 +1672,7 @@ export default function Home() {
                   const pct = sectorViewData.totalUSD > 0 ? (p.valueUSD / sectorViewData.totalUSD) * 100 : 0;
                   return (
                     <div className="ct-bar-row" key={p.ticker}>
-                      <span className="ct-mono">{p.ticker}</span>
+                      <span className="ct-bar-label" title={p.ticker}>{p.company || p.ticker}</span>
                       <div className="ct-bar-track"><div className="ct-bar-fill" style={{ width: `${Math.min(100, pct)}%` }} /></div>
                       <span className="ct-mono ct-bar-val">{sectorValueMode === 'value' ? fmtMoney(fromUSD(p.valueUSD, displayCurrency), displayCurrency, 0) : `${pct.toFixed(1)}%`}</span>
                     </div>
@@ -1703,8 +1706,8 @@ export default function Home() {
                       const itPct = sectorViewData.totalUSD > 0 ? (it.valueUSD / sectorViewData.totalUSD) * 100 : 0;
                       return (
                         <div className="ct-sector-subrow" key={it.ticker}>
-                          <span className="ct-mono">{it.ticker}</span>
-                          <span className="ct-mono">{sectorValueMode === 'value' ? fmtMoney(fromUSD(it.valueUSD, displayCurrency), displayCurrency, 0) : `${itPct.toFixed(1)}%`}</span>
+                          <span className="ct-sector-subrow-label" title={it.ticker}>{it.company || it.ticker}</span>
+                          <span className="ct-mono ct-sector-subrow-val">{sectorValueMode === 'value' ? fmtMoney(fromUSD(it.valueUSD, displayCurrency), displayCurrency, 0) : `${itPct.toFixed(1)}%`}</span>
                         </div>
                       );
                     })}
