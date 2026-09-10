@@ -225,6 +225,16 @@ function CalendarPopover({ value, onChange, onClose, pos }) {
   );
 }
 
+// Renders one pill per owner on a record; a record left with no owners
+// (after an owner was removed) shows a single "Unassigned" pill instead of
+// nothing, so it stays visibly flagged rather than silently blank.
+function OwnerPills({ ownerIds, ownersById }) {
+  if (ownerIds.length === 0) return <span className="ct-owner-pill ct-owner-pill-unassigned">Unassigned</span>;
+  return ownerIds.map((oid) => ownersById[oid] ? (
+    <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
+  ) : null);
+}
+
 export default function Home() {
 
   const [owners, setOwners] = useState(seedOwners);
@@ -459,8 +469,33 @@ export default function Home() {
     setShowAddOwner(false);
   };
 
+  // Records with no owners (left over after removing an owner) stay visible
+  // regardless of the active filter, tagged "Unassigned" — never silently
+  // hidden or deleted.
+  const ownerMatchesFilter = (ownerIds) =>
+    ownerIds.length === 0 || ownerIds.some((oid) => selectedOwnerIds.includes(oid));
+
+  const removeOwner = (ownerId) => {
+    if (owners.length <= 1) return; // always keep at least one owner to add holdings against
+    const owner = owners.find((o) => o.id === ownerId);
+    if (!owner) return;
+    const confirmed = window.confirm(
+      `Remove ${owner.name}? They'll be taken off every holding, sale, and dividend they're on. Records left with no owners will show as "Unassigned" rather than being deleted.`
+    );
+    if (!confirmed) return;
+
+    setOwners((prev) => prev.filter((o) => o.id !== ownerId));
+    setLots((prev) => prev.map((l) => (l.ownerIds.includes(ownerId) ? { ...l, ownerIds: l.ownerIds.filter((id) => id !== ownerId) } : l)));
+    setSales((prev) => prev.map((s) => (s.ownerIds.includes(ownerId) ? { ...s, ownerIds: s.ownerIds.filter((id) => id !== ownerId) } : s)));
+    setDividends((prev) => prev.map((d) => (d.ownerIds.includes(ownerId) ? { ...d, ownerIds: d.ownerIds.filter((id) => id !== ownerId) } : d)));
+    setSelectedOwnerIds((prev) => {
+      const next = prev.filter((id) => id !== ownerId);
+      return next.length > 0 ? next : owners.filter((o) => o.id !== ownerId).map((o) => o.id);
+    });
+  };
+
   const filteredLots = useMemo(
-    () => lots.filter((l) => l.ownerIds.some((oid) => selectedOwnerIds.includes(oid))),
+    () => lots.filter((l) => ownerMatchesFilter(l.ownerIds)),
     [lots, selectedOwnerIds]
   );
 
@@ -529,7 +564,7 @@ export default function Home() {
 
   const salesEnriched = useMemo(() => {
     return sales
-      .filter((s) => s.ownerIds.some((oid) => selectedOwnerIds.includes(oid)))
+      .filter((s) => ownerMatchesFilter(s.ownerIds))
       .map((s) => {
         const costBasisTotal = s.costBasisPerShare * s.shares;
         const gainPct = costBasisTotal > 0 ? (s.realizedGainAbs / costBasisTotal) * 100 : 0;
@@ -586,7 +621,7 @@ export default function Home() {
     return historyByTicker[`${refTicker}__${growthPeriod}`].map((point) => {
       let totalUSD = 0;
       lots.forEach((l) => {
-        if (!l.ownerIds.some((oid) => selectedOwnerIds.includes(oid))) return;
+        if (!ownerMatchesFilter(l.ownerIds)) return;
         const close = closeOnOrBefore(l.ticker, point.date);
         const currency = quotes[l.ticker]?.currency || 'USD';
         if (close != null) totalUSD += toUSD(l.shares * close, currency);
@@ -764,7 +799,7 @@ export default function Home() {
     if (!sellPrice || sellPrice <= 0) return setSellError('Enter a sale price greater than 0.');
     setSellError('');
 
-    const groupLots = lots.filter((l) => l.ticker === sellForm.ticker && l.ownerIds.some((oid) => selectedOwnerIds.includes(oid)));
+    const groupLots = lots.filter((l) => l.ticker === sellForm.ticker && ownerMatchesFilter(l.ownerIds));
     const totalShares = groupLots.reduce((s, l) => s + l.shares, 0);
     let remaining = sharesToSell;
     const keptLots = [];
@@ -884,7 +919,7 @@ export default function Home() {
 
   const dividendsEnriched = useMemo(() => {
     return dividends
-      .filter((d) => d.ownerIds.some((oid) => selectedOwnerIds.includes(oid)))
+      .filter((d) => ownerMatchesFilter(d.ownerIds))
       .map((d) => ({ ...d, amountDisplay: fromUSD(toUSD(d.amount, d.currency), displayCurrency) }))
       .sort((a, b) => new Date(b.payDate) - new Date(a.payDate));
   }, [dividends, selectedOwnerIds, displayCurrency, fxRates]);
@@ -949,6 +984,8 @@ export default function Home() {
         .ct-tab { padding: 8px 16px; border-radius: 7px; border: none; background: transparent; color: var(--text-muted); font-family: 'Inter'; font-size: 13px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; }
         .ct-tab.active { background: var(--surface-hover); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
         .ct-tab-dot { width: 7px; height: 7px; border-radius: 50%; }
+        .ct-tab-remove { display: inline-flex; align-items: center; justify-content: center; margin-left: 2px; padding: 1px; border-radius: 50%; color: inherit; opacity: 0.55; }
+        .ct-tab-remove:hover { opacity: 1; color: var(--neg); background: rgba(248,113,113,0.14); }
         .ct-add-owner-btn { padding: 8px 14px; border-radius: 9px; border: 1px dashed var(--border); background: transparent; color: var(--text-faint); font-size: 12.5px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 5px; }
         .ct-add-owner-inline { display: flex; gap: 6px; align-items: center; }
         .ct-add-owner-inline input { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; color: var(--text); font-size: 12.5px; outline: none; width: 140px; }
@@ -1006,6 +1043,7 @@ export default function Home() {
         .ct-mono { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
         .ct-owner-pills { display: flex; flex-wrap: wrap; gap: 4px; }
         .ct-owner-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 100px; font-size: 10.5px; font-weight: 700; border: 1px solid; }
+        .ct-owner-pill-unassigned { color: var(--text-faint); border-color: var(--text-faint); border-style: dashed; }
         .ct-badge { display: inline-flex; align-items: center; gap: 3px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; padding: 3px 7px; border-radius: 6px; }
         .ct-badge.pos { background: rgba(74,222,128,0.12); color: var(--pos); }
         .ct-badge.neg { background: rgba(248,113,113,0.12); color: var(--neg); }
@@ -1137,10 +1175,18 @@ export default function Home() {
           <div className="ct-tabs">
             <button className={`ct-tab ${isAllSelected ? 'active' : ''}`} onClick={selectAllOwners}>Everyone</button>
             {owners.map((o) => (
-              <button key={o.id} className={`ct-tab ${selectedOwnerIds.includes(o.id) ? 'active' : ''}`} onClick={() => toggleOwnerFilter(o.id)}>
+              <div key={o.id} className={`ct-tab ${selectedOwnerIds.includes(o.id) ? 'active' : ''}`} onClick={() => toggleOwnerFilter(o.id)}>
                 <span className="ct-tab-dot" style={{ background: o.color }} />
                 {o.name}
-              </button>
+                {owners.length > 1 && (
+                  <button
+                    type="button" className="ct-tab-remove" title={`Remove ${o.name}`}
+                    onClick={(e) => { e.stopPropagation(); removeOwner(o.id); }}
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </div>
             ))}
           </div>
           {showAddOwner ? (
@@ -1260,16 +1306,14 @@ export default function Home() {
               <div className="ct-ledger-row">
                 <div className="ct-cell-asset ct-asset-name">
                   <span className="ct-asset-ticker">
-                    {g.ticker}
+                    {g.company}
                     {g.source === 'yahoo' && <span className="ct-source-flag" title="Priced via the Yahoo Finance fallback (best-effort, can be temporarily unavailable) since Finnhub doesn't cover this listing">GLOBAL</span>}
                     {g.source === 'manual' && <span className="ct-source-flag manual" title={`You're tracking this price yourself — last updated ${manualPrices[g.ticker]?.updatedDate || ''}`}>MANUAL</span>}
                   </span>
-                  <span className="ct-asset-company">{g.company}</span>
+                  <span className="ct-asset-company">{g.ticker}</span>
                 </div>
                 <div className="ct-cell-owner ct-owner-pills">
-                  {g.ownerIds.map((oid) => ownersById[oid] ? (
-                    <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
-                  ) : null)}
+                  <OwnerPills ownerIds={g.ownerIds} ownersById={ownersById} />
                 </div>
                 <div className="ct-cell-meta">
                   <span className="ct-mono"><span className="ct-mobile-label">Shares </span>{g.shares}</span>
@@ -1295,16 +1339,14 @@ export default function Home() {
               </div>
 
               {expandedTicker === g.ticker && lots
-                .filter((l) => l.ticker === g.ticker && l.ownerIds.some((oid) => selectedOwnerIds.includes(oid)))
+                .filter((l) => l.ticker === g.ticker && ownerMatchesFilter(l.ownerIds))
                 .map((l) => (
                   <div className="ct-lot-subrow" key={l.id}>
                     <span className="ct-mono">{l.dateBought}</span>
                     <span className="ct-mono">{l.shares} sh</span>
                     <span className="ct-mono">{fmtMoney(l.purchasePrice, l.currency)}</span>
                     <div className="ct-owner-pills">
-                      {l.ownerIds.map((oid) => ownersById[oid] ? (
-                        <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
-                      ) : null)}
+                      <OwnerPills ownerIds={l.ownerIds} ownersById={ownersById} />
                     </div>
                     <button className="ct-remove-btn" onClick={() => removeLot(l.id)} title="Delete this individual purchase"><X size={13} /></button>
                   </div>
@@ -1381,13 +1423,11 @@ export default function Home() {
               {salesEnriched.map((s) => (
                 <div className="ct-sold-row" key={s.id}>
                   <div className="ct-cell-asset ct-asset-name">
-                    <span className="ct-asset-ticker">{s.ticker}</span>
-                    <span className="ct-asset-company">{s.company}</span>
+                    <span className="ct-asset-ticker">{s.company}</span>
+                    <span className="ct-asset-company">{s.ticker}</span>
                   </div>
                   <div className="ct-cell-owner ct-owner-pills">
-                    {s.ownerIds.map((oid) => ownersById[oid] ? (
-                      <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
-                    ) : null)}
+                    <OwnerPills ownerIds={s.ownerIds} ownersById={ownersById} />
                   </div>
                   <div className="ct-cell-meta">
                     <span className="ct-mono"><span className="ct-mobile-label">Shares </span>{s.shares}</span>
@@ -1422,13 +1462,11 @@ export default function Home() {
             <React.Fragment key={g.ticker}>
               <div className="ct-div-row">
                 <div className="ct-cell-asset ct-asset-name">
-                  <span className="ct-asset-ticker">{g.ticker}</span>
-                  <span className="ct-asset-company">{g.company}</span>
+                  <span className="ct-asset-ticker">{g.company}</span>
+                  <span className="ct-asset-company">{g.ticker}</span>
                 </div>
                 <div className="ct-cell-owner ct-owner-pills">
-                  {g.ownerIds.map((oid) => ownersById[oid] ? (
-                    <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
-                  ) : null)}
+                  <OwnerPills ownerIds={g.ownerIds} ownersById={ownersById} />
                 </div>
                 <span className="ct-cell-amount ct-mono pos">+{fmtMoney(g.amountDisplay, displayCurrency)}</span>
                 <span className="ct-cell-date ct-mono">{g.divIds.length > 1 ? `${g.divIds.length}× · latest ${g.latestDate}` : g.latestDate}</span>
@@ -1449,9 +1487,7 @@ export default function Home() {
                     <span className="ct-mono">{d.payDate}</span>
                     <span className="ct-mono pos">+{fmtMoney(d.amount, d.currency)}</span>
                     <div className="ct-owner-pills">
-                      {d.ownerIds.map((oid) => ownersById[oid] ? (
-                        <span key={oid} className="ct-owner-pill" style={{ color: ownersById[oid].color, borderColor: ownersById[oid].color }}>{ownersById[oid].name}</span>
-                      ) : null)}
+                      <OwnerPills ownerIds={d.ownerIds} ownersById={ownersById} />
                     </div>
                     <button className="ct-remove-btn" onClick={() => removeDividend(d.id)} title="Delete this individual payment"><X size={13} /></button>
                   </div>
