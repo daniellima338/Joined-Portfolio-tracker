@@ -583,16 +583,22 @@ export default function Home() {
     if (donutBy === 'owner') {
       return owners.map((o) => {
         const valueUSD = lots.reduce((s, l) => {
-          const q = quotes[l.ticker];
-          const native = ownerShareOfLot(l, q?.price ?? l.purchasePrice, o.id);
-          return s + toUSD(native, q?.currency || 'USD');
+          // Manual-priced tickers never appear in `quotes` (they're excluded
+          // from fetching), so falling back to quotes[l.ticker]?.currency
+          // silently defaulted to 'USD' here and left SEK/DKK/EUR amounts
+          // unconverted — inflating totals for anyone holding those.
+          const manual = manualPrices[l.ticker];
+          const price = manual ? manual.price : (quotes[l.ticker]?.price ?? l.purchasePrice);
+          const currency = manual ? manual.currency : (quotes[l.ticker]?.currency || l.currency);
+          const native = ownerShareOfLot(l, price, o.id);
+          return s + toUSD(native, currency);
         }, 0);
         return { name: o.name, value: Math.round(fromUSD(valueUSD, displayCurrency) * 100) / 100, color: o.color };
       }).filter((d) => d.value > 0);
     }
     const palette = ['#C9A24B', '#E0A458', '#4FD1C5', '#A78BFA', '#7FB2E5', '#E58A8A', '#8FBF8F', '#D6A9E8'];
     return groupedHoldings.map((g, i) => ({ name: g.ticker, value: g.valueDisplay, color: palette[i % palette.length] }));
-  }, [donutBy, groupedHoldings, lots, quotes, owners, displayCurrency, fxRates]);
+  }, [donutBy, groupedHoldings, lots, quotes, manualPrices, owners, displayCurrency, fxRates]);
 
   const chartData = useMemo(() => {
     let refTicker = null, refLen = 0;
