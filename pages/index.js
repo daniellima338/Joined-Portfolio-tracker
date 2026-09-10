@@ -294,6 +294,11 @@ export default function Home() {
   // ---- shared persistence (Upstash) -----------------------------------
   const [hasLoadedState, setHasLoadedState] = useState(false);
   const [saveStatus, setSaveStatus] = useState('idle'); // idle | saving | saved | error
+  // Sector classification is persisted here too (not just kept in memory) —
+  // a ticker's industry barely ever changes, and re-fetching all of them from
+  // scratch on every page load is what runs into Finnhub's rate limit.
+  // Saving it means the whole household only ever pays that cost once.
+  const [sectorByTicker, setSectorByTicker] = useState({}); // { [ticker]: industry string | null }
 
   useEffect(() => {
     (async () => {
@@ -307,6 +312,7 @@ export default function Home() {
           setDividends(Array.isArray(data.dividends) ? data.dividends : []);
           setManualPrices(data.manualPrices && typeof data.manualPrices === 'object' ? data.manualPrices : {});
           setEtfHoldings(data.etfHoldings && typeof data.etfHoldings === 'object' ? data.etfHoldings : {});
+          setSectorByTicker(data.sectorByTicker && typeof data.sectorByTicker === 'object' ? data.sectorByTicker : {});
           setSelectedOwnerIds(data.owners.map((o) => o.id));
           const allIds = [...data.lots, ...(data.sales || []), ...(data.dividends || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
           idCounter = Math.max(idCounter, ...allIds, 0) + 1;
@@ -326,13 +332,13 @@ export default function Home() {
       fetch('/api/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ owners, lots, sales, dividends, manualPrices, etfHoldings }),
+        body: JSON.stringify({ owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker }),
       })
         .then((res) => setSaveStatus(res.ok ? 'saved' : 'error'))
         .catch(() => setSaveStatus('error'));
     }, 600);
     return () => clearTimeout(t);
-  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, hasLoadedState]);
+  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, hasLoadedState]);
 
 
   const [quotes, setQuotes] = useState({});
@@ -408,33 +414,56 @@ export default function Home() {
 
   // Sector classification (Finnhub's free /stock/profile2) for both directly
   // held tickers and any underlying tickers entered via "Manage ETF holdings"
-  // below. Fetched once per ticker and cached for the session — industry
-  // classification doesn't change often enough to warrant a refresh clock.
-  const [sectorByTicker, setSectorByTicker] = useState({}); // { [ticker]: industry string | null }
+  // below. Persisted to shared state (declared above, near the other
+  // persisted fields) rather than kept only in memory — a ticker's industry
+  // barely ever changes, and re-fetching all of them from scratch on every
+  // page load is what runs into Finnhub's rate limit in the first place.
+  //
+  // Requests are still chunked and spaced out client-side on top of that:
+  // with enough ETF look-through tickers entered, the missing list can run
+  // into the hundreds the first time, and firing them all in one batch blows
+  // straight through Finnhub's free-tier rate limit — anything rate-limited
+  // in that burst would otherwise be cached as permanently "Unknown".
   useEffect(() => {
     const allTickers = new Set(uniqueTickers);
     Object.values(etfHoldings).forEach((rows) => rows.forEach((h) => allTickers.add(h.ticker)));
     const missing = [...allTickers].filter((t) => !(t in sectorByTicker));
     if (missing.length === 0) return;
     let cancelled = false;
-    fetch(`/api/sector?tickers=${encodeURIComponent(missing.join(','))}`)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((data) => {
+
+    // Finnhub's free tier is ~60 calls/minute, shared with the live-quote
+    // fetch (which also hits Finnhub every 30s for every held ticker). 10
+    // per 12s keeps this comfortably under half that budget, leaving room
+    // for quotes rather than the two competing for the same limit.
+    const CHUNK_SIZE = 10;
+    const CHUNK_DELAY_MS = 12000;
+    const chunks = [];
+    for (let i = 0; i < missing.length; i += CHUNK_SIZE) chunks.push(missing.slice(i, i + CHUNK_SIZE));
+
+    (async () => {
+      for (const chunk of chunks) {
         if (cancelled) return;
-        setSectorByTicker((prev) => {
-          const next = { ...prev };
-          missing.forEach((t) => { next[t] = data[t] || null; });
-          return next;
-        });
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setSectorByTicker((prev) => {
-          const next = { ...prev };
-          missing.forEach((t) => { if (!(t in next)) next[t] = null; });
-          return next;
-        });
-      });
+        try {
+          const res = await fetch(`/api/sector?tickers=${encodeURIComponent(chunk.join(','))}`);
+          const data = res.ok ? await res.json() : {};
+          if (cancelled) return;
+          setSectorByTicker((prev) => {
+            const next = { ...prev };
+            chunk.forEach((t) => { next[t] = data[t] || null; });
+            return next;
+          });
+        } catch {
+          if (cancelled) return;
+          setSectorByTicker((prev) => {
+            const next = { ...prev };
+            chunk.forEach((t) => { if (!(t in next)) next[t] = null; });
+            return next;
+          });
+        }
+        if (chunk !== chunks[chunks.length - 1]) await new Promise((r) => setTimeout(r, CHUNK_DELAY_MS));
+      }
+    })();
+
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tickerKey, etfHoldings]);
