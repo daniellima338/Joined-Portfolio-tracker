@@ -18,7 +18,10 @@ async function getCik(ticker) {
     const res = await fetch('https://www.sec.gov/files/company_tickers.json', {
       headers: { 'User-Agent': SEC_USER_AGENT },
     });
-    if (!res.ok) throw new Error('Could not load SEC ticker list');
+    if (!res.ok) {
+      const bodySnippet = await res.text().then((t) => t.slice(0, 300)).catch(() => '');
+      throw new Error(`Could not load SEC ticker list (status ${res.status}): ${bodySnippet}`);
+    }
     const data = await res.json();
     tickerMapCache = {};
     Object.values(data).forEach((e) => {
