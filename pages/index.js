@@ -77,6 +77,27 @@ const seedLots = () => ([
 const ownerShareOfLot = (lot, price, ownerId) =>
   lot.ownerIds.includes(ownerId) ? (lot.shares * price) / lot.ownerIds.length : 0;
 
+// Standard 2-stage FCF-per-share DCF: FCF grows at `growthRate` for
+// `years`, then a Gordon-growth terminal value at `terminalGrowth`,
+// everything discounted at `discountRate`. Returns null for inputs that
+// don't produce a sane result (e.g. discount rate at or below terminal
+// growth, which makes the perpetuity formula diverge).
+const computeDcfFairValue = (fcf0, growthRate, years, terminalGrowth, discountRate) => {
+  if (!fcf0 || fcf0 <= 0 || !years || years <= 0 || discountRate <= terminalGrowth) return null;
+  const rows = [];
+  let fcf = fcf0;
+  let pvSum = 0;
+  for (let t = 1; t <= years; t++) {
+    fcf = fcf * (1 + growthRate);
+    const pv = fcf / Math.pow(1 + discountRate, t);
+    pvSum += pv;
+    rows.push({ year: t, fcf, pv });
+  }
+  const terminalValue = (fcf * (1 + terminalGrowth)) / (discountRate - terminalGrowth);
+  const pvTerminal = terminalValue / Math.pow(1 + discountRate, years);
+  return { rows, pvSum, terminalValue, pvTerminal, fairValue: pvSum + pvTerminal };
+};
+
 // -----------------------------------------------------------------------------
 // Fallback path: direct-from-browser Yahoo Finance, only used for tickers
 // Finnhub's free tier can't price (mainly non-US-only listings). Same
@@ -246,7 +267,7 @@ export default function Home() {
   const manualPricesRef = useRef({});
   useEffect(() => { manualPricesRef.current = manualPrices; }, [manualPrices]);
   const [selectedOwnerIds, setSelectedOwnerIds] = useState(() => seedOwners().map((o) => o.id));
-  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'sectors'
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'sectors' | 'dcf'
   const [donutBy, setDonutBy] = useState('owner');
   const [showAddOwner, setShowAddOwner] = useState(false);
   const [newOwnerName, setNewOwnerName] = useState('');
@@ -922,6 +943,57 @@ export default function Home() {
     return map;
   }, [lots, sales]);
 
+  // ---- DCF calculator: a manual-input sandbox, not auto-fetched. None of
+  // the app's free data sources (Finnhub/Stooq/Yahoo) reliably expose free
+  // cash flow for arbitrary tickers, especially the non-US names that make
+  // up most of this portfolio — so you type in the starting FCF/share and
+  // assumptions yourself. "Load from holdings" just prefills the label,
+  // currency, and current price from what's already in the app. ----
+  const [dcfTicker, setDcfTicker] = useState('');
+  const [dcfCompany, setDcfCompany] = useState('');
+  const [dcfCurrency, setDcfCurrency] = useState('USD');
+  const [dcfStartingFcf, setDcfStartingFcf] = useState('');
+  const [dcfCurrentPrice, setDcfCurrentPrice] = useState('');
+  const [dcfGrowthRate, setDcfGrowthRate] = useState(10);
+  const [dcfYears, setDcfYears] = useState(5);
+  const [dcfTerminalGrowth, setDcfTerminalGrowth] = useState(2.5);
+  const [dcfDiscountRate, setDcfDiscountRate] = useState(9);
+
+  const loadDcfFromHolding = (ticker) => {
+    setDcfTicker(ticker);
+    if (!ticker) return;
+    const known = knownTickers[ticker];
+    const held = groupedHoldings.find((g) => g.ticker === ticker);
+    setDcfCompany(known?.company || ticker);
+    setDcfCurrency(held?.currency || known?.currency || 'USD');
+    if (held?.currentPrice) setDcfCurrentPrice(String(held.currentPrice));
+  };
+
+  const dcfResult = useMemo(() => {
+    const fcf0 = parseNum(dcfStartingFcf);
+    const result = computeDcfFairValue(fcf0, dcfGrowthRate / 100, dcfYears, dcfTerminalGrowth / 100, dcfDiscountRate / 100);
+    if (!result) return null;
+    const currentPrice = parseNum(dcfCurrentPrice);
+    const upsidePct = currentPrice > 0 ? ((result.fairValue - currentPrice) / currentPrice) * 100 : null;
+    return { ...result, currentPrice: currentPrice > 0 ? currentPrice : null, upsidePct };
+  }, [dcfStartingFcf, dcfGrowthRate, dcfYears, dcfTerminalGrowth, dcfDiscountRate, dcfCurrentPrice]);
+
+  // A classic DCF sensitivity grid — discount rate vs. terminal growth —
+  // centered on the current sliders, so you can see at a glance how exposed
+  // the fair value is to the two assumptions that matter most.
+  const dcfSensitivity = useMemo(() => {
+    const fcf0 = parseNum(dcfStartingFcf);
+    if (!fcf0 || fcf0 <= 0) return null;
+    const steps = [-1, -0.5, 0, 0.5, 1];
+    const discountSteps = steps.map((d) => Math.round((dcfDiscountRate + d) * 100) / 100);
+    const terminalSteps = steps.map((d) => Math.round((dcfTerminalGrowth + d) * 100) / 100);
+    const grid = discountSteps.map((rPct) => terminalSteps.map((tgPct) => {
+      const r = computeDcfFairValue(fcf0, dcfGrowthRate / 100, dcfYears, tgPct / 100, rPct / 100);
+      return r ? r.fairValue : null;
+    }));
+    return { discountSteps, terminalSteps, grid };
+  }, [dcfStartingFcf, dcfGrowthRate, dcfYears, dcfDiscountRate, dcfTerminalGrowth]);
+
   const [divForm, setDivForm] = useState({ ticker: '', amount: '', currency: 'USD', date: toDateStr(new Date()), ownerIds: [] });
   const [divError, setDivError] = useState('');
   const [showDivCalendar, setShowDivCalendar] = useState(false);
@@ -1052,6 +1124,26 @@ export default function Home() {
         .ct-sector-subrow-val { flex-shrink: 0; }
         .ct-inline-input { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; color: var(--text); font-size: 12.5px; outline: none; width: 100%; }
         .ct-inline-input:focus { border-color: var(--gold); }
+        .ct-dcf-sliders { display: flex; flex-direction: column; gap: 16px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+        .ct-slider-row { display: flex; flex-direction: column; gap: 6px; }
+        .ct-slider-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); }
+        .ct-slider-label span:last-child { color: var(--gold); font-weight: 600; }
+        input[type="range"].ct-slider { -webkit-appearance: none; appearance: none; width: 100%; height: 4px; border-radius: 2px; background: var(--bg-elevated); outline: none; cursor: pointer; }
+        input[type="range"].ct-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--gold); border: 2px solid var(--bg); box-shadow: 0 0 0 1px var(--gold); cursor: pointer; }
+        input[type="range"].ct-slider::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--gold); border: 2px solid var(--bg); box-shadow: 0 0 0 1px var(--gold); cursor: pointer; }
+        .ct-dcf-result { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 20px; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border); }
+        .ct-dcf-breakdown { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
+        .ct-dcf-table { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-top: 10px; }
+        .ct-dcf-table-head { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; padding: 10px 16px; font-size: 10px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; border-bottom: 1px solid var(--border); }
+        .ct-dcf-table-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; padding: 9px 16px; font-size: 12.5px; border-bottom: 1px solid var(--border); }
+        .ct-dcf-table-row:last-child { border-bottom: none; }
+        .ct-dcf-table-terminal { background: var(--surface-hover); color: var(--gold); font-weight: 600; }
+        .ct-dcf-sensitivity-wrap { overflow-x: auto; margin-top: 10px; }
+        .ct-dcf-sensitivity { border-collapse: collapse; width: 100%; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; }
+        .ct-dcf-sensitivity th, .ct-dcf-sensitivity td { padding: 7px 10px; text-align: right; border: 1px solid var(--border); white-space: nowrap; }
+        .ct-dcf-sensitivity th { color: var(--text-faint); font-weight: 700; background: var(--bg-elevated); }
+        .ct-dcf-sensitivity td { color: var(--text-muted); }
+        .ct-dcf-sensitivity-center { background: rgba(201,162,75,0.14); color: var(--gold) !important; font-weight: 700; }
         .ct-panel-title { font-family: 'Fraunces', serif; font-size: 16px; font-weight: 500; margin: 0 0 2px; }
         .ct-panel-sub { color: var(--text-faint); font-size: 11.5px; margin-bottom: 14px; }
         .ct-panel-head { display: flex; justify-content: space-between; align-items: flex-start; }
@@ -1204,6 +1296,7 @@ export default function Home() {
         <div className="ct-tabs" style={{ marginBottom: 18 }}>
           <button className={`ct-tab ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>Dashboard</button>
           <button className={`ct-tab ${activeTab === 'sectors' ? 'active' : ''}`} onClick={() => setActiveTab('sectors')}>Sectors</button>
+          <button className={`ct-tab ${activeTab === 'dcf' ? 'active' : ''}`} onClick={() => setActiveTab('dcf')}>DCF</button>
         </div>
 
         <div className="ct-tabs-row">
@@ -1793,6 +1886,133 @@ export default function Home() {
               )}
             </div>
           </div>
+        </div>
+        )}
+
+        {activeTab === 'dcf' && (
+        <div className="ct-card" style={{ marginBottom: 22 }}>
+          <div className="ct-panel-head">
+            <div>
+              <div className="ct-panel-title">DCF Analysis</div>
+              <div className="ct-panel-sub">Discounted cash flow fair-value calculator — adjust the assumptions to see how the valuation moves</div>
+            </div>
+          </div>
+
+          <div className="ct-form-grid" style={{ marginTop: 14 }}>
+            <div className="ct-field">
+              <label>Load from holdings (optional)</label>
+              <select className="ct-currency-select" style={{ width: '100%' }} value={dcfTicker} onChange={(e) => loadDcfFromHolding(e.target.value)}>
+                <option value="">— Enter manually —</option>
+                {uniqueTickers.map((t) => <option key={t} value={t}>{knownTickers[t]?.company || t}</option>)}
+              </select>
+            </div>
+            <div className="ct-field">
+              <label>Label</label>
+              <input value={dcfCompany} onChange={(e) => setDcfCompany(e.target.value)} placeholder="Company name" />
+            </div>
+            <div className="ct-field">
+              <label>Starting FCF / share</label>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input type="number" step="0.01" value={dcfStartingFcf} onChange={(e) => setDcfStartingFcf(e.target.value)} placeholder="5.00" style={{ flex: 1 }} />
+                <select className="ct-currency-select" value={dcfCurrency} onChange={(e) => setDcfCurrency(e.target.value)}>
+                  {DISPLAY_CURRENCIES.includes(dcfCurrency) ? null : <option value={dcfCurrency}>{dcfCurrency}</option>}
+                  {DISPLAY_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+            <div className="ct-field">
+              <label>Current price (optional)</label>
+              <input type="number" step="0.01" value={dcfCurrentPrice} onChange={(e) => setDcfCurrentPrice(e.target.value)} placeholder="For upside/downside" />
+            </div>
+          </div>
+
+          <div className="ct-dcf-sliders">
+            <div className="ct-slider-row">
+              <div className="ct-slider-label"><span>Growth rate (years 1–{dcfYears})</span><span className="ct-mono">{dcfGrowthRate.toFixed(1)}%</span></div>
+              <input type="range" min="-10" max="40" step="0.5" value={dcfGrowthRate} onChange={(e) => setDcfGrowthRate(parseFloat(e.target.value))} className="ct-slider" />
+            </div>
+            <div className="ct-slider-row">
+              <div className="ct-slider-label"><span>Projection years</span><span className="ct-mono">{dcfYears}</span></div>
+              <input type="range" min="1" max="15" step="1" value={dcfYears} onChange={(e) => setDcfYears(parseInt(e.target.value, 10))} className="ct-slider" />
+            </div>
+            <div className="ct-slider-row">
+              <div className="ct-slider-label"><span>Terminal growth rate</span><span className="ct-mono">{dcfTerminalGrowth.toFixed(1)}%</span></div>
+              <input type="range" min="0" max="5" step="0.1" value={dcfTerminalGrowth} onChange={(e) => setDcfTerminalGrowth(parseFloat(e.target.value))} className="ct-slider" />
+            </div>
+            <div className="ct-slider-row">
+              <div className="ct-slider-label"><span>Discount rate (WACC)</span><span className="ct-mono">{dcfDiscountRate.toFixed(1)}%</span></div>
+              <input type="range" min="1" max="20" step="0.25" value={dcfDiscountRate} onChange={(e) => setDcfDiscountRate(parseFloat(e.target.value))} className="ct-slider" />
+            </div>
+          </div>
+
+          {dcfResult ? (
+            <>
+              <div className="ct-dcf-result">
+                <div>
+                  <div className="ct-card-label">Fair Value / Share{dcfCompany ? ` — ${dcfCompany}` : ''}</div>
+                  <div className="ct-card-value" style={{ fontSize: 34 }}>{fmtMoney(dcfResult.fairValue, dcfCurrency)}</div>
+                  {dcfResult.upsidePct != null && (
+                    <div className={`ct-badge ${dcfResult.upsidePct >= 0 ? 'pos' : 'neg'}`} style={{ marginTop: 8 }}>
+                      {dcfResult.upsidePct >= 0 ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
+                      {fmtPct(dcfResult.upsidePct)} vs current price {fmtMoney(dcfResult.currentPrice, dcfCurrency)}
+                    </div>
+                  )}
+                </div>
+                <div className="ct-dcf-breakdown">
+                  <div className="ct-legend-row"><span className="ct-legend-left">PV of projected cash flows</span><span className="ct-legend-val">{fmtMoney(dcfResult.pvSum, dcfCurrency)}</span></div>
+                  <div className="ct-legend-row"><span className="ct-legend-left">PV of terminal value</span><span className="ct-legend-val">{fmtMoney(dcfResult.pvTerminal, dcfCurrency)}</span></div>
+                </div>
+              </div>
+
+              <div className="ct-panel-sub" style={{ marginTop: 18 }}>Year-by-year projection</div>
+              <div className="ct-dcf-table">
+                <div className="ct-dcf-table-head"><div>Year</div><div>Projected FCF</div><div>Present value</div></div>
+                {dcfResult.rows.map((row) => (
+                  <div className="ct-dcf-table-row" key={row.year}>
+                    <div className="ct-mono">{row.year}</div>
+                    <div className="ct-mono">{fmtMoney(row.fcf, dcfCurrency)}</div>
+                    <div className="ct-mono">{fmtMoney(row.pv, dcfCurrency)}</div>
+                  </div>
+                ))}
+                <div className="ct-dcf-table-row ct-dcf-table-terminal">
+                  <div className="ct-mono">Terminal</div>
+                  <div className="ct-mono">{fmtMoney(dcfResult.terminalValue, dcfCurrency)}</div>
+                  <div className="ct-mono">{fmtMoney(dcfResult.pvTerminal, dcfCurrency)}</div>
+                </div>
+              </div>
+
+              {dcfSensitivity && (
+                <>
+                  <div className="ct-panel-sub" style={{ marginTop: 18 }}>Sensitivity — fair value by discount rate × terminal growth</div>
+                  <div className="ct-dcf-sensitivity-wrap">
+                    <table className="ct-dcf-sensitivity">
+                      <thead>
+                        <tr>
+                          <th />
+                          {dcfSensitivity.terminalSteps.map((tg, i) => <th key={i}>{tg.toFixed(1)}%</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {dcfSensitivity.discountSteps.map((r, ri) => (
+                          <tr key={ri}>
+                            <th>{r.toFixed(2)}%</th>
+                            {dcfSensitivity.grid[ri].map((val, ci) => (
+                              <td key={ci} className={ri === 2 && ci === 2 ? 'ct-dcf-sensitivity-center' : ''}>
+                                {val != null ? fmtMoney(val, dcfCurrency, 0) : '—'}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="ct-field-hint" style={{ marginTop: 8 }}>Rows: discount rate · Columns: terminal growth rate · highlighted cell matches your current sliders</div>
+                </>
+              )}
+            </>
+          ) : (
+            <div className="ct-empty" style={{ marginTop: 18 }}>Enter a starting FCF per share above to see the valuation (discount rate must be higher than the terminal growth rate)</div>
+          )}
         </div>
         )}
 
