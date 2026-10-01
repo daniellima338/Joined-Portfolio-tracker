@@ -969,6 +969,38 @@ export default function Home() {
     if (held?.currentPrice) setDcfCurrentPrice(String(held.currentPrice));
   };
 
+  // Pulls trailing-twelve-month FCF/share from SEC EDGAR (US filers only —
+  // see pages/api/fundamentals.js for why there's no free equivalent for
+  // the rest of this portfolio).
+  const [dcfFundamentalsLoading, setDcfFundamentalsLoading] = useState(false);
+  const [dcfFundamentalsError, setDcfFundamentalsError] = useState('');
+  const [dcfFundamentalsInfo, setDcfFundamentalsInfo] = useState('');
+
+  const fetchDcfFundamentals = async () => {
+    const ticker = dcfTicker.trim();
+    if (!ticker) return;
+    setDcfFundamentalsLoading(true);
+    setDcfFundamentalsError('');
+    setDcfFundamentalsInfo('');
+    try {
+      const res = await fetch(`/api/fundamentals?ticker=${encodeURIComponent(ticker)}`);
+      const data = await res.json();
+      if (!res.ok) {
+        setDcfFundamentalsError(data.error || 'Could not fetch SEC data for this ticker.');
+        return;
+      }
+      setDcfStartingFcf(data.fcfPerShare.toFixed(2));
+      setDcfCurrency('USD'); // SEC filings are always reported in USD
+      setDcfFundamentalsInfo(
+        `TTM FCF/share as of ${data.periodEnd} — CFO ${fmtMoney(data.ttmCfo, 'USD', 0)} − CapEx ${fmtMoney(data.ttmCapex, 'USD', 0)}, ÷ ${(data.dilutedShares / 1e6).toFixed(0)}M diluted shares (SEC EDGAR)`
+      );
+    } catch {
+      setDcfFundamentalsError('Could not reach SEC EDGAR — try again in a moment.');
+    } finally {
+      setDcfFundamentalsLoading(false);
+    }
+  };
+
   const dcfResult = useMemo(() => {
     const fcf0 = parseNum(dcfStartingFcf);
     const result = computeDcfFairValue(fcf0, dcfGrowthRate / 100, dcfYears, dcfTerminalGrowth / 100, dcfDiscountRate / 100);
@@ -1907,23 +1939,33 @@ export default function Home() {
               </select>
             </div>
             <div className="ct-field">
-              <label>Label</label>
-              <input value={dcfCompany} onChange={(e) => setDcfCompany(e.target.value)} placeholder="Company name" />
+              <label>Ticker (for SEC lookup)</label>
+              <input value={dcfTicker} onChange={(e) => setDcfTicker(normalizeTicker(e.target.value))} placeholder="AAPL" />
             </div>
             <div className="ct-field">
-              <label>Starting FCF / share</label>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <input type="number" step="0.01" value={dcfStartingFcf} onChange={(e) => setDcfStartingFcf(e.target.value)} placeholder="5.00" style={{ flex: 1 }} />
-                <select className="ct-currency-select" value={dcfCurrency} onChange={(e) => setDcfCurrency(e.target.value)}>
-                  {DISPLAY_CURRENCIES.includes(dcfCurrency) ? null : <option value={dcfCurrency}>{dcfCurrency}</option>}
-                  {DISPLAY_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
+              <label>Label</label>
+              <input value={dcfCompany} onChange={(e) => setDcfCompany(e.target.value)} placeholder="Company name" />
             </div>
             <div className="ct-field">
               <label>Current price (optional)</label>
               <input type="number" step="0.01" value={dcfCurrentPrice} onChange={(e) => setDcfCurrentPrice(e.target.value)} placeholder="For upside/downside" />
             </div>
+          </div>
+
+          <div className="ct-field" style={{ marginTop: 10 }}>
+            <label>Starting FCF / share</label>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input type="number" step="0.01" value={dcfStartingFcf} onChange={(e) => setDcfStartingFcf(e.target.value)} placeholder="5.00" style={{ flex: 1 }} />
+              <select className="ct-currency-select" value={dcfCurrency} onChange={(e) => setDcfCurrency(e.target.value)}>
+                {DISPLAY_CURRENCIES.includes(dcfCurrency) ? null : <option value={dcfCurrency}>{dcfCurrency}</option>}
+                {DISPLAY_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <button type="button" className="ct-sell-btn" onClick={fetchDcfFundamentals} disabled={dcfFundamentalsLoading || !dcfTicker.trim()}>
+                {dcfFundamentalsLoading ? 'Fetching…' : 'Fetch TTM FCF from SEC (US only)'}
+              </button>
+            </div>
+            {dcfFundamentalsError && <div className="ct-field-hint" style={{ color: 'var(--neg)', marginTop: 6 }}>{dcfFundamentalsError}</div>}
+            {dcfFundamentalsInfo && <div className="ct-field-hint" style={{ marginTop: 6 }}>{dcfFundamentalsInfo}</div>}
           </div>
 
           <div className="ct-dcf-sliders">
