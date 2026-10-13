@@ -320,6 +320,10 @@ export default function Home() {
   // scratch on every page load is what runs into Finnhub's rate limit.
   // Saving it means the whole household only ever pays that cost once.
   const [sectorByTicker, setSectorByTicker] = useState({}); // { [ticker]: industry string | null }
+  // Saved DCF valuations, keyed by upper-cased ticker — shown on the dashboard next to the current price.
+  // { [ticker]: { ticker, company, currency, fairValue, sellPremiumPct, sellPrice, priceAtAnalysis, startingFcf,
+  //               growthRate, years, terminalGrowth, discountRate, note, savedAt } }
+  const [dcfValuations, setDcfValuations] = useState({});
 
   useEffect(() => {
     (async () => {
@@ -334,6 +338,7 @@ export default function Home() {
           setManualPrices(data.manualPrices && typeof data.manualPrices === 'object' ? data.manualPrices : {});
           setEtfHoldings(data.etfHoldings && typeof data.etfHoldings === 'object' ? data.etfHoldings : {});
           setSectorByTicker(data.sectorByTicker && typeof data.sectorByTicker === 'object' ? data.sectorByTicker : {});
+          setDcfValuations(data.dcfValuations && typeof data.dcfValuations === 'object' ? data.dcfValuations : {});
           setSelectedOwnerIds(data.owners.map((o) => o.id));
           const allIds = [...data.lots, ...(data.sales || []), ...(data.dividends || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
           idCounter = Math.max(idCounter, ...allIds, 0) + 1;
@@ -353,13 +358,13 @@ export default function Home() {
       fetch('/api/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker }),
+        body: JSON.stringify({ owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfValuations }),
       })
         .then((res) => setSaveStatus(res.ok ? 'saved' : 'error'))
         .catch(() => setSaveStatus('error'));
     }, 600);
     return () => clearTimeout(t);
-  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, hasLoadedState]);
+  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfValuations, hasLoadedState]);
 
 
   const [quotes, setQuotes] = useState({});
@@ -959,6 +964,79 @@ export default function Home() {
   const [dcfTerminalGrowth, setDcfTerminalGrowth] = useState(2.5);
   const [dcfDiscountRate, setDcfDiscountRate] = useState(9);
 
+  // Sell price = fair value plus a premium; saved valuations show on the dashboard.
+  const [dcfSellPremium, setDcfSellPremium] = useState(20);
+  const [dcfSaveTicker, setDcfSaveTicker] = useState('');
+  const [dcfNote, setDcfNote] = useState('');
+  const [dcfSaveMsg, setDcfSaveMsg] = useState(null);
+
+  const saveDcfValuation = () => {
+    const ticker = dcfSaveTicker.trim().toUpperCase();
+    if (!ticker) { setDcfSaveMsg({ ok: false, text: 'Enter the ticker to save this valuation under.' }); return; }
+    if (!dcfResult) { setDcfSaveMsg({ ok: false, text: 'There is no valid valuation to save yet.' }); return; }
+    const premium = Number.isFinite(dcfSellPremium) ? dcfSellPremium : 0;
+    const price = parseNum(dcfCurrentPrice);
+    setDcfValuations((prev) => ({
+      ...prev,
+      [ticker]: {
+        ticker,
+        company: dcfCompany.trim() || ticker,
+        currency: dcfCurrency,
+        fairValue: Math.round(dcfResult.fairValue * 100) / 100,
+        sellPremiumPct: premium,
+        sellPrice: Math.round(dcfResult.fairValue * (1 + premium / 100) * 100) / 100,
+        priceAtAnalysis: price > 0 ? price : null,
+        startingFcf: parseNum(dcfStartingFcf),
+        growthRate: dcfGrowthRate,
+        years: dcfYears,
+        terminalGrowth: dcfTerminalGrowth,
+        discountRate: dcfDiscountRate,
+        note: dcfNote.trim(),
+        savedAt: toDateStr(new Date()),
+      },
+    }));
+    setDcfSaveMsg({ ok: true, text: `Saved for ${ticker}. It now shows on the dashboard.` });
+  };
+
+  const removeDcfValuation = (ticker) => {
+    setDcfValuations((prev) => {
+      const next = { ...prev };
+      delete next[ticker];
+      return next;
+    });
+  };
+
+  // Where the current price sits against a saved valuation. Compared in USD so a
+  // valuation in one currency still works against a price quoted in another.
+  const valuationStatus = (price, priceCurrency, v) => {
+    if (!(price > 0) || !v) return null;
+    const p = toUSD(price, priceCurrency);
+    const f = toUSD(v.fairValue, v.currency);
+    const s = toUSD(v.sellPrice, v.currency);
+    if (!(p > 0) || !(f > 0)) return null;
+    const vsFairPct = ((p - f) / f) * 100;
+    if (p >= s) return { label: 'Above sell price', tone: 'sell', vsFairPct };
+    if (p > f) return { label: 'Above fair value', tone: 'warn', vsFairPct };
+    if (p >= f * 0.9) return { label: 'Near fair value', tone: 'neutral', vsFairPct };
+    return { label: 'Below fair value', tone: 'pos', vsFairPct };
+  };
+
+  const valuationByTicker = useMemo(() => {
+    const m = {};
+    Object.values(dcfValuations).forEach((v) => { m[String(v.ticker).toUpperCase()] = v; });
+    return m;
+  }, [dcfValuations]);
+
+  const valuationRows = useMemo(() => {
+    return Object.values(dcfValuations).map((v) => {
+      const held = groupedHoldings.find((g) => String(g.ticker).toUpperCase() === String(v.ticker).toUpperCase());
+      const price = held ? held.currentPrice : v.priceAtAnalysis;
+      const priceCurrency = held ? held.currency : v.currency;
+      return { ...v, held: !!held, price, priceCurrency, status: valuationStatus(price, priceCurrency, v) };
+    }).sort((a, b) => (a.status?.vsFairPct ?? 1e9) - (b.status?.vsFairPct ?? 1e9));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dcfValuations, groupedHoldings, fxRates]);
+
   // Paste box for the JSON the "DCF Workbench" artifact copies out.
   const [dcfImportText, setDcfImportText] = useState('');
   const [dcfImportMsg, setDcfImportMsg] = useState(null);
@@ -972,6 +1050,7 @@ export default function Home() {
       const clampNum = (v, lo, hi, fallback) => (Number.isFinite(Number(v)) ? Math.min(hi, Math.max(lo, Number(v))) : fallback);
       const known = d.ticker && uniqueTickers.includes(d.ticker) ? d.ticker : '';
       setDcfTicker(known);
+      setDcfSaveTicker(String(d.ticker || '').toUpperCase());
       setDcfCompany(String(d.company || d.ticker || ''));
       if (typeof d.currency === 'string' && d.currency) setDcfCurrency(d.currency);
       setDcfStartingFcf(String(fcf));
@@ -990,6 +1069,7 @@ export default function Home() {
   const loadDcfFromHolding = (ticker) => {
     setDcfTicker(ticker);
     if (!ticker) return;
+    setDcfSaveTicker(ticker.toUpperCase());
     const known = knownTickers[ticker];
     const held = groupedHoldings.find((g) => g.ticker === ticker);
     setDcfCompany(known?.company || ticker);
@@ -1195,6 +1275,16 @@ export default function Home() {
         .ct-asset-company { color: var(--text-faint); font-size: 11px; margin-top: 1px; }
         .ct-source-flag { font-size: 9px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-family: 'Inter'; font-weight: 700; text-transform: uppercase; cursor: help; }
         .ct-source-flag.manual { color: var(--gold); border-color: var(--gold); }
+        .ct-val-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 3px; font-size: 11px; color: var(--text-faint); }
+        .ct-val-line b { color: var(--text); font-weight: 500; }
+        .ct-val-tag { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 100px; border: 1px solid var(--border); color: var(--text-muted); }
+        .ct-val-tag.pos { color: var(--pos); border-color: var(--pos); }
+        .ct-val-tag.warn { color: var(--gold); border-color: var(--gold); }
+        .ct-val-tag.sell { color: var(--neg); border-color: var(--neg); }
+        .ct-val-head { display: grid; grid-template-columns: 2.2fr 1fr 1fr 1.3fr 1.8fr 40px; gap: 8px; padding: 12px 18px; font-size: 10.5px; text-transform: uppercase; color: var(--text-faint); font-weight: 700; border-bottom: 1px solid var(--border); }
+        .ct-val-row { display: grid; grid-template-columns: 2.2fr 1fr 1fr 1.3fr 1.8fr 40px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .ct-val-row:last-child { border-bottom: none; }
+        .ct-val-row:hover { background: var(--surface-hover); }
         .ct-mono { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
         .ct-owner-pills { display: flex; flex-wrap: wrap; gap: 4px; }
         .ct-owner-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 100px; font-size: 10.5px; font-weight: 700; border: 1px solid; }
@@ -1268,7 +1358,9 @@ export default function Home() {
         .ct-mobile-label { display: none; }
 
         @media (max-width: 640px) {
-          .ct-ledger-head, .ct-sold-head, .ct-div-head { display: none; }
+          .ct-ledger-head, .ct-sold-head, .ct-div-head, .ct-val-head { display: none; }
+          .ct-val-row { grid-template-columns: 1fr 1fr; row-gap: 8px; padding: 16px; }
+          .ct-val-row > :first-child { grid-column: 1 / -1; }
 
           .ct-ledger-row, .ct-sold-row, .ct-div-row {
             display: grid;
@@ -1452,6 +1544,29 @@ export default function Home() {
           </div>
         </div>
 
+        {valuationRows.length > 0 && (
+          <>
+            <div className="ct-section-title">Valuations</div>
+            <div className="ct-section-sub">Saved DCF analyses · sorted by how far the price sits below (or above) fair value · sell price = fair value plus the premium set when saving · edit them on the DCF tab</div>
+            <div className="ct-ledger">
+              <div className="ct-val-head"><div>Stock</div><div>Price</div><div>Fair value</div><div>Sell price</div><div>Status</div><div /></div>
+              {valuationRows.map((r) => (
+                <div className="ct-val-row" key={r.ticker}>
+                  <div className="ct-asset-name">
+                    <span className="ct-asset-ticker">{r.company}{!r.held && <span className="ct-source-flag" title="Not in the holdings shown — price is from when the analysis was saved">NOT HELD</span>}</span>
+                    <span className="ct-asset-company">{r.ticker} · saved {r.savedAt}{r.note ? ` · ${r.note}` : ''}</span>
+                  </div>
+                  <div className="ct-mono"><span className="ct-mobile-label">Price </span>{r.price > 0 ? fmtMoney(r.price, r.priceCurrency) : '—'}</div>
+                  <div className="ct-mono"><span className="ct-mobile-label">Fair </span>{fmtMoney(r.fairValue, r.currency)}</div>
+                  <div className="ct-mono"><span className="ct-mobile-label">Sell </span>{fmtMoney(r.sellPrice, r.currency)} <span style={{ color: 'var(--text-faint)', fontSize: 10.5 }}>(+{r.sellPremiumPct}%)</span></div>
+                  <div>{r.status ? <span className={`ct-val-tag ${r.status.tone}`}>{r.status.label} · {fmtPct(r.status.vsFairPct)}</span> : <span style={{ color: 'var(--text-faint)' }}>No price</span>}</div>
+                  <div><button className="ct-remove-btn" onClick={() => removeDcfValuation(r.ticker)} title="Remove this saved valuation"><X size={14} /></button></div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
         <div className="ct-section-title">Holdings</div>
         <div className="ct-section-sub">{filterLabel} · same ticker across owners (or multiple purchases) merges into one row with a weighted-average cost · click ×N to see and manage individual purchases</div>
         <div className="ct-ledger">
@@ -1467,6 +1582,17 @@ export default function Home() {
                     {g.source === 'manual' && <span className="ct-source-flag manual" title={`You're tracking this price yourself — last updated ${manualPrices[g.ticker]?.updatedDate || ''}`}>MANUAL</span>}
                   </span>
                   <span className="ct-asset-company">{g.ticker}</span>
+                  {valuationByTicker[String(g.ticker).toUpperCase()] && (() => {
+                    const v = valuationByTicker[String(g.ticker).toUpperCase()];
+                    const st = valuationStatus(g.currentPrice, g.currency, v);
+                    return (
+                      <span className="ct-val-line" title={`DCF saved ${v.savedAt}${v.note ? ` — ${v.note}` : ''}`}>
+                        <span>Fair <b className="ct-mono">{fmtMoney(v.fairValue, v.currency)}</b></span>
+                        <span>Sell <b className="ct-mono">{fmtMoney(v.sellPrice, v.currency)}</b></span>
+                        {st && <span className={`ct-val-tag ${st.tone}`}>{st.label}</span>}
+                      </span>
+                    );
+                  })()}
                 </div>
                 <div className="ct-cell-owner ct-owner-pills">
                   <OwnerPills ownerIds={g.ownerIds} ownersById={ownersById} />
@@ -1987,6 +2113,10 @@ export default function Home() {
               <div className="ct-slider-label"><span>Discount rate (WACC)</span><span className="ct-mono">{dcfDiscountRate.toFixed(1)}%</span></div>
               <input type="range" min="1" max="20" step="0.25" value={dcfDiscountRate} onChange={(e) => setDcfDiscountRate(parseFloat(e.target.value))} className="ct-slider" />
             </div>
+            <div className="ct-slider-row">
+              <div className="ct-slider-label"><span>Sell premium above fair value</span><span className="ct-mono">{dcfSellPremium.toFixed(0)}%</span></div>
+              <input type="range" min="0" max="60" step="1" value={dcfSellPremium} onChange={(e) => setDcfSellPremium(parseFloat(e.target.value))} className="ct-slider" />
+            </div>
           </div>
 
           {dcfResult ? (
@@ -1995,6 +2125,9 @@ export default function Home() {
                 <div>
                   <div className="ct-card-label">Fair Value / Share{dcfCompany ? ` — ${dcfCompany}` : ''}</div>
                   <div className="ct-card-value" style={{ fontSize: 34 }}>{fmtMoney(dcfResult.fairValue, dcfCurrency)}</div>
+                  <div className="ct-field-hint" style={{ marginTop: 6 }}>
+                    Sell price <span className="ct-mono">{fmtMoney(dcfResult.fairValue * (1 + dcfSellPremium / 100), dcfCurrency)}</span> (fair value + {dcfSellPremium.toFixed(0)}%)
+                  </div>
                   {dcfResult.upsidePct != null && (
                     <div className={`ct-badge ${dcfResult.upsidePct >= 0 ? 'pos' : 'neg'}`} style={{ marginTop: 8 }}>
                       {dcfResult.upsidePct >= 0 ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
@@ -2053,6 +2186,25 @@ export default function Home() {
                   <div className="ct-field-hint" style={{ marginTop: 8 }}>Rows: discount rate · Columns: terminal growth rate · highlighted cell matches your current sliders</div>
                 </>
               )}
+
+              <div className="ct-panel-sub" style={{ marginTop: 22 }}>Save to dashboard</div>
+              <div className="ct-field-hint" style={{ marginBottom: 8 }}>Shows the fair value and sell price next to the stock on the dashboard, and in the Valuations list. Saving the same ticker again replaces the earlier valuation.</div>
+              <div className="ct-form-grid">
+                <div className="ct-field">
+                  <label>Ticker to save under</label>
+                  <input value={dcfSaveTicker} onChange={(e) => { setDcfSaveTicker(e.target.value); setDcfSaveMsg(null); }} placeholder="e.g. ALMB.CO (as in Holdings)" />
+                </div>
+                <div className="ct-field">
+                  <label>Note (optional)</label>
+                  <input value={dcfNote} onChange={(e) => setDcfNote(e.target.value)} placeholder="Sources, what you assumed" />
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 }}>
+                <button type="button" className="ct-add-btn" onClick={saveDcfValuation}>
+                  {dcfValuations[dcfSaveTicker.trim().toUpperCase()] ? 'Update saved valuation' : 'Save valuation'}
+                </button>
+                {dcfSaveMsg && <span style={{ fontSize: 12, color: dcfSaveMsg.ok ? 'var(--pos)' : 'var(--neg)' }}>{dcfSaveMsg.text}</span>}
+              </div>
             </>
           ) : (
             <div className="ct-empty" style={{ marginTop: 18 }}>Enter a starting FCF per share above to see the valuation (discount rate must be higher than the terminal growth rate)</div>
