@@ -959,6 +959,34 @@ export default function Home() {
   const [dcfTerminalGrowth, setDcfTerminalGrowth] = useState(2.5);
   const [dcfDiscountRate, setDcfDiscountRate] = useState(9);
 
+  // Paste box for the JSON the "DCF Workbench" artifact copies out.
+  const [dcfImportText, setDcfImportText] = useState('');
+  const [dcfImportMsg, setDcfImportMsg] = useState(null);
+
+  const importDcfFromText = () => {
+    try {
+      const d = JSON.parse(dcfImportText);
+      if (!d || d.commingledDcf !== 1) throw new Error('not a DCF Workbench export');
+      const fcf = Number(d.startingFcf);
+      if (!Number.isFinite(fcf) || fcf <= 0) throw new Error('missing starting FCF');
+      const clampNum = (v, lo, hi, fallback) => (Number.isFinite(Number(v)) ? Math.min(hi, Math.max(lo, Number(v))) : fallback);
+      const known = d.ticker && uniqueTickers.includes(d.ticker) ? d.ticker : '';
+      setDcfTicker(known);
+      setDcfCompany(String(d.company || d.ticker || ''));
+      if (typeof d.currency === 'string' && d.currency) setDcfCurrency(d.currency);
+      setDcfStartingFcf(String(fcf));
+      setDcfCurrentPrice(Number(d.currentPrice) > 0 ? String(d.currentPrice) : '');
+      setDcfGrowthRate(clampNum(d.growthRate, -10, 40, 10));
+      setDcfYears(Math.round(clampNum(d.years, 1, 15, 5)));
+      setDcfTerminalGrowth(clampNum(d.terminalGrowth, 0, 5, 2.5));
+      setDcfDiscountRate(clampNum(d.discountRate, 1, 20, 9));
+      setDcfImportText('');
+      setDcfImportMsg({ ok: true, text: 'Imported' + (d.company ? ` ${d.company}` : '') + '.' });
+    } catch (err) {
+      setDcfImportMsg({ ok: false, text: "That doesn't look like a DCF Workbench export. Use the Copy for Commingled button and paste the whole text." });
+    }
+  };
+
   const loadDcfFromHolding = (ticker) => {
     setDcfTicker(ticker);
     if (!ticker) return;
@@ -1896,6 +1924,22 @@ export default function Home() {
               <div className="ct-panel-title">DCF Analysis</div>
               <div className="ct-panel-sub">Discounted cash flow fair-value calculator — adjust the assumptions to see how the valuation moves</div>
             </div>
+          </div>
+
+          <div className="ct-field" style={{ marginTop: 14 }}>
+            <label>Import from DCF Workbench (optional)</label>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input
+                value={dcfImportText}
+                onChange={(e) => { setDcfImportText(e.target.value); setDcfImportMsg(null); }}
+                placeholder="Paste the text copied from the DCF Workbench"
+                style={{ flex: 1 }}
+              />
+              <button type="button" className="ct-add-btn" disabled={!dcfImportText.trim()} onClick={importDcfFromText}>Import</button>
+            </div>
+            {dcfImportMsg && (
+              <div style={{ fontSize: 12, marginTop: 6, color: dcfImportMsg.ok ? 'var(--pos)' : 'var(--neg)' }}>{dcfImportMsg.text}</div>
+            )}
           </div>
 
           <div className="ct-form-grid" style={{ marginTop: 14 }}>
