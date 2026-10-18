@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   computeDcfFairValue, upsidePct, toNumber, perShareFcf, validateInputs, fairValueFromInputs, sensitivityGrid,
-  normalizeTicker, isValidIsoDate, valuationFromInputs, migrateDcfValuations, daysUntil, upcomingReports,
+  normalizeTicker, isValidIsoDate, valuationFromInputs, daysUntil, upcomingReports,
 } from '../lib/dcf.js';
 
 const close = (actual, expected, tol = 0.005, msg) =>
@@ -199,49 +199,6 @@ test('valuationFromInputs gives display fields, or null without a valid valuatio
   assert.equal(valuationFromInputs({ ticker: 'X', nextReportDate: '2026-11-01' }), null); // report date only
   assert.equal(valuationFromInputs({ ...base, ticker: 'X', startingFcf: '' }), null);
   assert.equal(valuationFromInputs({ ...base, ticker: 'X', fcfBasis: 'total', startingFcf: '10', sharesOutstanding: '10', netDebt: '1000' }), null); // value below zero
-});
-
-test('migrateDcfValuations converts old entries and the recomputed fair value matches the stored one', () => {
-  const old = {
-    'ALMB.CO': {
-      ticker: 'ALMB.CO', company: 'Alm. Brand', currency: 'DKK', fairValue: 17.11, sellPremiumPct: 20, sellPrice: 20.53,
-      priceAtAnalysis: 17.76, startingFcf: 1, growthRate: 4, years: 5, terminalGrowth: 2, discountRate: 8.5,
-      note: 'first pass', savedAt: '2026-10-13',
-    },
-    AAPL: {
-      ticker: 'AAPL', company: 'Apple Inc.', currency: 'USD', fairValue: 119.06, sellPremiumPct: 20, sellPrice: 142.88,
-      priceAtAnalysis: 150, startingFcf: 6.5, growthRate: 6, years: 5, terminalGrowth: 2.5, discountRate: 9,
-      note: '', savedAt: '2026-10-13',
-    },
-  };
-  const copy = JSON.parse(JSON.stringify(old));
-  const { inputs, report } = migrateDcfValuations(old);
-  assert.deepEqual(old, copy); // input untouched
-  assert.equal(report.count, 2);
-  assert.deepEqual(report.mismatches, []);
-  const a = inputs['ALMB.CO'];
-  assert.equal(a.fcfBasis, 'perShare');
-  assert.equal(a.currency, 'DKK');
-  assert.equal(a.startingFcf, 1);
-  assert.equal(a.sellPremiumPct, 20);
-  assert.equal(a.nextReportDate, '');
-  assert.equal(a.updatedAt, '2026-10-13');
-  assert.equal(a.note, 'first pass');
-  close(fairValueFromInputs(a).fairValue, 17.11, 0.005);
-});
-
-test('migrateDcfValuations reports a mismatch and skips entries without a ticker; empty input is fine', () => {
-  const { inputs, report } = migrateDcfValuations({
-    X: { ticker: 'x', company: 'X', currency: 'USD', fairValue: 99, startingFcf: 1, growthRate: 4, years: 5, terminalGrowth: 2, discountRate: 8.5 },
-    bad: { company: 'No ticker', fairValue: 1 },
-  });
-  assert.equal(report.count, 1);
-  assert.equal(report.skipped, 1);
-  assert.equal(report.mismatches.length, 1);
-  assert.equal(report.mismatches[0].ticker, 'X');
-  assert.ok(inputs.X);
-  assert.deepEqual(migrateDcfValuations(undefined).inputs, {});
-  assert.deepEqual(migrateDcfValuations({}).report, { count: 0, mismatches: [], skipped: 0 });
 });
 
 test('daysUntil counts whole calendar days, including across month ends and leap days', () => {

@@ -6,7 +6,7 @@ import {
 import { Search, Plus, X, TrendingUp, TrendingDown, Calendar as CalendarIcon, ChevronLeft, ChevronRight } from 'lucide-react';
 import {
   sensitivityGrid, fairValueFromInputs, validateInputs, upsidePct, normalizeTicker as dcfKey, isValidIsoDate,
-  valuationFromInputs, migrateDcfValuations, upcomingReports,
+  valuationFromInputs, upcomingReports,
 } from '../lib/dcf';
 
 const OWNER_PALETTE = ['#E0A458', '#4FD1C5', '#A78BFA', '#7FB2E5', '#E58A8A', '#8FBF8F', '#D6A9E8', '#F2C14E'];
@@ -308,14 +308,9 @@ export default function Home() {
   // scratch on every page load is what runs into Finnhub's rate limit.
   // Saving it means the whole household only ever pays that cost once.
   const [sectorByTicker, setSectorByTicker] = useState({}); // { [ticker]: industry string | null }
-  // Saved DCF valuations, keyed by upper-cased ticker — shown on the dashboard next to the current price.
-  // { [ticker]: { ticker, company, currency, fairValue, sellPremiumPct, sellPrice, priceAtAnalysis, startingFcf,
-  //               growthRate, years, terminalGrowth, discountRate, note, savedAt } }
-  const [dcfValuations, setDcfValuations] = useState({}); // older format, kept untouched until dcfMigration is confirmed
-  // DCF inputs per upper-cased ticker, the single source of truth (see lib/dcf.js for the entry shape).
-  // Fair value is recalculated from these, never stored.
+  // DCF inputs per upper-cased ticker, shown on the dashboard next to the current price (see lib/dcf.js for the
+  // entry shape). Fair value is recalculated from these, never stored.
   const [dcfInputs, setDcfInputs] = useState({});
-  const [dcfMigration, setDcfMigration] = useState(null); // { at, from, count } once dcfValuations has been copied into dcfInputs
 
   useEffect(() => {
     (async () => {
@@ -332,9 +327,7 @@ export default function Home() {
           setManualPrices(data.manualPrices && typeof data.manualPrices === 'object' ? data.manualPrices : {});
           setEtfHoldings(data.etfHoldings && typeof data.etfHoldings === 'object' ? data.etfHoldings : {});
           setSectorByTicker(data.sectorByTicker && typeof data.sectorByTicker === 'object' ? data.sectorByTicker : {});
-          setDcfValuations(data.dcfValuations && typeof data.dcfValuations === 'object' ? data.dcfValuations : {});
           setDcfInputs(data.dcfInputs && typeof data.dcfInputs === 'object' ? data.dcfInputs : {});
-          setDcfMigration(data.dcfMigration && typeof data.dcfMigration === 'object' ? data.dcfMigration : null);
           setSelectedOwnerIds(data.owners.map((o) => o.id));
           const allIds = [...data.lots, ...(data.sales || []), ...(data.dividends || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
           idCounter = Math.max(idCounter, ...allIds, 0) + 1;
@@ -348,7 +341,7 @@ export default function Home() {
   }, []);
 
   // Everything that gets saved. Add new persisted keys here and in the load effect above.
-  const persistedState = { owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfValuations, dcfInputs, dcfMigration };
+  const persistedState = { owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfInputs };
   const persistedStateRef = useRef(persistedState);
   persistedStateRef.current = persistedState;
   const lastSavedJsonRef = useRef(null); // what the server holds, as far as this page knows
@@ -400,7 +393,7 @@ export default function Home() {
     const t = setTimeout(saveNow, 600);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfValuations, dcfInputs, dcfMigration, hasLoadedState]);
+  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfInputs, hasLoadedState]);
 
 
   const [quotes, setQuotes] = useState({});
@@ -986,28 +979,8 @@ export default function Home() {
 
   // ---- DCF inputs ----
   // Saved inputs per ticker live in dcfInputs, the single source of truth. Fair value is never stored: it is
-  // always recalculated from the inputs with lib/dcf.js. dcfValuations is the older saved format. It is left
-  // untouched in the saved data, and until dcfMigration is set its entries are read as if already converted.
-  // Any change to dcfInputs converts them first (see commitDcfInputs), so the two never mix.
-  const legacyMigration = useMemo(() => migrateDcfValuations(dcfValuations), [dcfValuations]);
-  const effectiveInputs = useMemo(
-    () => (dcfMigration ? dcfInputs : { ...legacyMigration.inputs, ...dcfInputs }),
-    [dcfMigration, dcfInputs, legacyMigration]
-  );
-
-  const commitDcfInputs = (update) => {
-    setDcfInputs(update(effectiveInputs));
-    if (!dcfMigration) setDcfMigration({ at: new Date().toISOString(), from: 'dcfValuations', count: legacyMigration.report.count });
-  };
-
-  const [dcfMigrateMsg, setDcfMigrateMsg] = useState(null);
-  const migrateDcfNow = () => {
-    commitDcfInputs((m) => m);
-    const { count, mismatches } = legacyMigration.report;
-    setDcfMigrateMsg(mismatches.length === 0
-      ? { ok: true, text: `Migrated ${count} saved valuation${count === 1 ? '' : 's'}. Each recalculated fair value matches the one saved earlier. The old data is still in the saved state, untouched.` }
-      : { ok: false, text: `Migrated ${count}. ${mismatches.length} recalculated to a different fair value than saved earlier (${mismatches.map((x) => x.ticker).join(', ')}). The old data is still in the saved state, untouched.` });
-  };
+  // always recalculated from the inputs with lib/dcf.js.
+  const commitDcfInputs = (update) => setDcfInputs(update(dcfInputs));
 
   // Downloads the saved state exactly as the server holds it (including its revision number).
   const [backupMsg, setBackupMsg] = useState(null);
@@ -1148,8 +1121,8 @@ export default function Home() {
   };
 
   const valuations = useMemo(
-    () => Object.values(effectiveInputs).map(valuationFromInputs).filter(Boolean),
-    [effectiveInputs]
+    () => Object.values(dcfInputs).map(valuationFromInputs).filter(Boolean),
+    [dcfInputs]
   );
 
   const valuationByTicker = useMemo(() => {
@@ -1170,8 +1143,8 @@ export default function Home() {
 
   // Next report dates for the holdings in the current view: upcoming first, past ones (greyed) last.
   const reportRows = useMemo(
-    () => upcomingReports(effectiveInputs, groupedHoldings.map((g) => g.ticker), toDateStr(new Date())),
-    [effectiveInputs, groupedHoldings]
+    () => upcomingReports(dcfInputs, groupedHoldings.map((g) => g.ticker), toDateStr(new Date())),
+    [dcfInputs, groupedHoldings]
   );
 
   // Paste box for the JSON the "DCF Workbench" artifact copies out. Optional extra fields are used when
@@ -1188,7 +1161,7 @@ export default function Home() {
       const clampNum = (v, lo, hi, fallback) => (Number.isFinite(Number(v)) ? Math.min(hi, Math.max(lo, Number(v))) : fallback);
       const ticker = dcfKey(d.ticker);
       const known = d.ticker && uniqueTickers.includes(d.ticker) ? d.ticker : '';
-      const saved = effectiveInputs[ticker];
+      const saved = dcfInputs[ticker];
       setDcfTicker(known);
       setDcfSaveTicker(ticker);
       setDcfCompany(String(d.company || d.ticker || ''));
@@ -1218,7 +1191,7 @@ export default function Home() {
     const t = dcfKey(ticker);
     const known = knownTickers[ticker];
     const held = groupedHoldings.find((g) => g.ticker === ticker);
-    const saved = effectiveInputs[t];
+    const saved = dcfInputs[t];
     if (saved) loadDcfEntry(saved);
     else {
       resetDcfForm();
@@ -1420,7 +1393,6 @@ export default function Home() {
         .ct-asset-company { color: var(--text-faint); font-size: 11px; margin-top: 1px; }
         .ct-source-flag { font-size: 9px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-family: 'Inter'; font-weight: 700; text-transform: uppercase; cursor: help; }
         .ct-source-flag.manual { color: var(--gold); border-color: var(--gold); }
-        .ct-notice { border: 1px solid var(--gold); border-radius: 10px; padding: 12px 14px; background: var(--surface-hover); }
         .ct-val-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 3px; font-size: 11px; color: var(--text-faint); }
         .ct-val-line b { color: var(--text); font-weight: 500; }
         .ct-val-tag { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 100px; border: 1px solid var(--border); color: var(--text-muted); }
@@ -2227,22 +2199,6 @@ export default function Home() {
           </div>
           {backupMsg && <div style={{ fontSize: 12, marginTop: 6, color: backupMsg.ok ? 'var(--pos)' : 'var(--neg)' }}>{backupMsg.text}</div>}
 
-          {!dcfMigration && legacyMigration.report.count > 0 && (
-            <div className="ct-notice" style={{ marginTop: 14 }}>
-              <div style={{ fontSize: 13, fontWeight: 600 }}>Saved valuations use the older format</div>
-              <div className="ct-field-hint" style={{ marginTop: 4 }}>
-                {legacyMigration.report.count} saved valuation{legacyMigration.report.count === 1 ? '' : 's'} still show correctly. Migrating copies {legacyMigration.report.count === 1 ? 'it' : 'them'} into the new inputs format
-                (which also holds shares outstanding and next report dates). The old data stays in the saved state, untouched, until you say it can go.
-                Download a backup first.
-              </div>
-              <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                <button type="button" className="ct-sell-btn" onClick={downloadBackup}>Download backup</button>
-                <button type="button" className="ct-add-btn" onClick={migrateDcfNow}>Migrate now</button>
-              </div>
-            </div>
-          )}
-          {dcfMigrateMsg && <div style={{ fontSize: 12, marginTop: 8, color: dcfMigrateMsg.ok ? 'var(--pos)' : 'var(--neg)' }}>{dcfMigrateMsg.text}</div>}
-
           <div className="ct-field" style={{ marginTop: 14 }}>
             <label>Import from DCF Workbench (optional)</label>
             <div style={{ display: 'flex', gap: 6 }}>
@@ -2427,7 +2383,7 @@ export default function Home() {
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 }}>
                 <button type="button" className="ct-add-btn" onClick={saveDcfInputs}>
-                  {effectiveInputs[dcfKey(dcfSaveTicker)] ? 'Update saved inputs' : 'Save inputs'}
+                  {dcfInputs[dcfKey(dcfSaveTicker)] ? 'Update saved inputs' : 'Save inputs'}
                 </button>
                 {dcfSaveMsg && <span style={{ fontSize: 12, color: dcfSaveMsg.ok ? 'var(--pos)' : 'var(--neg)' }}>{dcfSaveMsg.text}</span>}
               </div>
@@ -2446,7 +2402,7 @@ export default function Home() {
                 <label>{knownTickers[t]?.company || t} <span style={{ color: 'var(--text-faint)' }}>· {t}</span></label>
                 <input
                   type="date"
-                  value={isValidIsoDate(effectiveInputs[dcfKey(t)]?.nextReportDate) ? effectiveInputs[dcfKey(t)].nextReportDate : ''}
+                  value={isValidIsoDate(dcfInputs[dcfKey(t)]?.nextReportDate) ? dcfInputs[dcfKey(t)].nextReportDate : ''}
                   onChange={(e) => setReportDateFor(t, e.target.value)}
                 />
               </div>
