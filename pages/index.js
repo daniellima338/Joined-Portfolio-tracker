@@ -4,6 +4,10 @@ import {
   PieChart, Pie, Cell,
 } from 'recharts';
 import { Search, Plus, X, TrendingUp, TrendingDown, Calendar as CalendarIcon, ChevronLeft, ChevronRight } from 'lucide-react';
+import {
+  sensitivityGrid, fairValueFromInputs, validateInputs, upsidePct, normalizeTicker as dcfKey, isValidIsoDate,
+  valuationFromInputs, migrateDcfValuations, upcomingReports,
+} from '../lib/dcf';
 
 const OWNER_PALETTE = ['#E0A458', '#4FD1C5', '#A78BFA', '#7FB2E5', '#E58A8A', '#8FBF8F', '#D6A9E8', '#F2C14E'];
 const QUOTE_REFRESH_MS = 30000;
@@ -77,26 +81,6 @@ const seedLots = () => ([
 const ownerShareOfLot = (lot, price, ownerId) =>
   lot.ownerIds.includes(ownerId) ? (lot.shares * price) / lot.ownerIds.length : 0;
 
-// Standard 2-stage FCF-per-share DCF: FCF grows at `growthRate` for
-// `years`, then a Gordon-growth terminal value at `terminalGrowth`,
-// everything discounted at `discountRate`. Returns null for inputs that
-// don't produce a sane result (e.g. discount rate at or below terminal
-// growth, which makes the perpetuity formula diverge).
-const computeDcfFairValue = (fcf0, growthRate, years, terminalGrowth, discountRate) => {
-  if (!fcf0 || fcf0 <= 0 || !years || years <= 0 || discountRate <= terminalGrowth) return null;
-  const rows = [];
-  let fcf = fcf0;
-  let pvSum = 0;
-  for (let t = 1; t <= years; t++) {
-    fcf = fcf * (1 + growthRate);
-    const pv = fcf / Math.pow(1 + discountRate, t);
-    pvSum += pv;
-    rows.push({ year: t, fcf, pv });
-  }
-  const terminalValue = (fcf * (1 + terminalGrowth)) / (discountRate - terminalGrowth);
-  const pvTerminal = terminalValue / Math.pow(1 + discountRate, years);
-  return { rows, pvSum, terminalValue, pvTerminal, fairValue: pvSum + pvTerminal };
-};
 
 // -----------------------------------------------------------------------------
 // Fallback path: direct-from-browser Yahoo Finance, only used for tickers
@@ -314,7 +298,11 @@ export default function Home() {
 
   // ---- shared persistence (Upstash) -----------------------------------
   const [hasLoadedState, setHasLoadedState] = useState(false);
-  const [saveStatus, setSaveStatus] = useState('idle'); // idle | saving | saved | error
+  const [saveStatus, setSaveStatus] = useState('idle'); // idle | saving | saved | error | stale
+  const revisionRef = useRef(0); // revision of the saved state this page last loaded or saved
+  const saveInFlightRef = useRef(false);
+  const savePendingRef = useRef(false);
+  const staleRef = useRef(false); // set once the server says our data is out of date; stops all further saves
   // Sector classification is persisted here too (not just kept in memory) —
   // a ticker's industry barely ever changes, and re-fetching all of them from
   // scratch on every page load is what runs into Finnhub's rate limit.
@@ -323,13 +311,19 @@ export default function Home() {
   // Saved DCF valuations, keyed by upper-cased ticker — shown on the dashboard next to the current price.
   // { [ticker]: { ticker, company, currency, fairValue, sellPremiumPct, sellPrice, priceAtAnalysis, startingFcf,
   //               growthRate, years, terminalGrowth, discountRate, note, savedAt } }
-  const [dcfValuations, setDcfValuations] = useState({});
+  const [dcfValuations, setDcfValuations] = useState({}); // older format, kept untouched until dcfMigration is confirmed
+  // DCF inputs per upper-cased ticker, the single source of truth (see lib/dcf.js for the entry shape).
+  // Fair value is recalculated from these, never stored.
+  const [dcfInputs, setDcfInputs] = useState({});
+  const [dcfMigration, setDcfMigration] = useState(null); // { at, from, count } once dcfValuations has been copied into dcfInputs
 
   useEffect(() => {
     (async () => {
       try {
         const res = await fetch('/api/state');
         const data = await res.json();
+        // The revision this page's data is based on; every save must quote it (see pages/api/state.js).
+        revisionRef.current = Number.isInteger(data?.revision) ? data.revision : 0;
         if (data && Array.isArray(data.owners) && Array.isArray(data.lots)) {
           setOwners(data.owners);
           setLots(data.lots);
@@ -339,6 +333,8 @@ export default function Home() {
           setEtfHoldings(data.etfHoldings && typeof data.etfHoldings === 'object' ? data.etfHoldings : {});
           setSectorByTicker(data.sectorByTicker && typeof data.sectorByTicker === 'object' ? data.sectorByTicker : {});
           setDcfValuations(data.dcfValuations && typeof data.dcfValuations === 'object' ? data.dcfValuations : {});
+          setDcfInputs(data.dcfInputs && typeof data.dcfInputs === 'object' ? data.dcfInputs : {});
+          setDcfMigration(data.dcfMigration && typeof data.dcfMigration === 'object' ? data.dcfMigration : null);
           setSelectedOwnerIds(data.owners.map((o) => o.id));
           const allIds = [...data.lots, ...(data.sales || []), ...(data.dividends || [])].map((l) => (typeof l.id === 'number' ? l.id : 0));
           idCounter = Math.max(idCounter, ...allIds, 0) + 1;
@@ -351,20 +347,60 @@ export default function Home() {
     })();
   }, []);
 
-  useEffect(() => {
-    if (!hasLoadedState) return; // don't save until we've attempted to load first — avoids overwriting a real save with seed data
-    setSaveStatus('saving');
-    const t = setTimeout(() => {
-      fetch('/api/state', {
+  // Everything that gets saved. Add new persisted keys here and in the load effect above.
+  const persistedState = { owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfValuations, dcfInputs, dcfMigration };
+  const persistedStateRef = useRef(persistedState);
+  persistedStateRef.current = persistedState;
+  const lastSavedJsonRef = useRef(null); // what the server holds, as far as this page knows
+
+  // One save at a time, each quoting the revision it is based on. If the server
+  // says someone else saved in the meantime (409), this page's data is stale:
+  // stop saving and reload rather than overwrite their newer data.
+  const saveNow = async () => {
+    if (staleRef.current) return;
+    if (saveInFlightRef.current) { savePendingRef.current = true; return; }
+    const json = JSON.stringify(persistedStateRef.current);
+    if (json === lastSavedJsonRef.current) { setSaveStatus('saved'); return; }
+    saveInFlightRef.current = true;
+    try {
+      const res = await fetch('/api/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfValuations }),
-      })
-        .then((res) => setSaveStatus(res.ok ? 'saved' : 'error'))
-        .catch(() => setSaveStatus('error'));
-    }, 600);
+        body: JSON.stringify({ ...persistedStateRef.current, baseRevision: revisionRef.current }),
+      });
+      if (res.status === 409) {
+        staleRef.current = true;
+        setSaveStatus('stale');
+        setTimeout(() => window.location.reload(), 2500);
+        return;
+      }
+      if (!res.ok) { setSaveStatus('error'); return; }
+      const out = await res.json().catch(() => ({}));
+      if (Number.isInteger(out.revision)) revisionRef.current = out.revision;
+      lastSavedJsonRef.current = json;
+      setSaveStatus('saved');
+    } catch {
+      setSaveStatus('error');
+    } finally {
+      saveInFlightRef.current = false;
+      if (savePendingRef.current && !staleRef.current) { savePendingRef.current = false; saveNow(); }
+    }
+  };
+
+  useEffect(() => {
+    if (!hasLoadedState || staleRef.current) return; // don't save until we've attempted to load first — avoids overwriting a real save with seed data
+    const json = JSON.stringify(persistedStateRef.current);
+    if (lastSavedJsonRef.current === null) { // first pass after loading: nothing has changed yet, so nothing to save
+      lastSavedJsonRef.current = json;
+      setSaveStatus('saved');
+      return;
+    }
+    if (json === lastSavedJsonRef.current) return;
+    setSaveStatus('saving');
+    const t = setTimeout(saveNow, 600);
     return () => clearTimeout(t);
-  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfValuations, hasLoadedState]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [owners, lots, sales, dividends, manualPrices, etfHoldings, sectorByTicker, dcfValuations, dcfInputs, dcfMigration, hasLoadedState]);
 
 
   const [quotes, setQuotes] = useState({});
@@ -948,62 +984,152 @@ export default function Home() {
     return map;
   }, [lots, sales]);
 
-  // ---- DCF calculator: a manual-input sandbox, not auto-fetched. None of
-  // the app's free data sources (Finnhub/Stooq/Yahoo) reliably expose free
-  // cash flow for arbitrary tickers, especially the non-US names that make
-  // up most of this portfolio — so you type in the starting FCF/share and
-  // assumptions yourself. "Load from holdings" just prefills the label,
-  // currency, and current price from what's already in the app. ----
+  // ---- DCF inputs ----
+  // Saved inputs per ticker live in dcfInputs, the single source of truth. Fair value is never stored: it is
+  // always recalculated from the inputs with lib/dcf.js. dcfValuations is the older saved format. It is left
+  // untouched in the saved data, and until dcfMigration is set its entries are read as if already converted.
+  // Any change to dcfInputs converts them first (see commitDcfInputs), so the two never mix.
+  const legacyMigration = useMemo(() => migrateDcfValuations(dcfValuations), [dcfValuations]);
+  const effectiveInputs = useMemo(
+    () => (dcfMigration ? dcfInputs : { ...legacyMigration.inputs, ...dcfInputs }),
+    [dcfMigration, dcfInputs, legacyMigration]
+  );
+
+  const commitDcfInputs = (update) => {
+    setDcfInputs(update(effectiveInputs));
+    if (!dcfMigration) setDcfMigration({ at: new Date().toISOString(), from: 'dcfValuations', count: legacyMigration.report.count });
+  };
+
+  const [dcfMigrateMsg, setDcfMigrateMsg] = useState(null);
+  const migrateDcfNow = () => {
+    commitDcfInputs((m) => m);
+    const { count, mismatches } = legacyMigration.report;
+    setDcfMigrateMsg(mismatches.length === 0
+      ? { ok: true, text: `Migrated ${count} saved valuation${count === 1 ? '' : 's'}. Each recalculated fair value matches the one saved earlier. The old data is still in the saved state, untouched.` }
+      : { ok: false, text: `Migrated ${count}. ${mismatches.length} recalculated to a different fair value than saved earlier (${mismatches.map((x) => x.ticker).join(', ')}). The old data is still in the saved state, untouched.` });
+  };
+
+  // Downloads the saved state exactly as the server holds it (including its revision number).
+  const [backupMsg, setBackupMsg] = useState(null);
+  const downloadBackup = async () => {
+    try {
+      const res = await fetch('/api/state');
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const name = `commingled-backup-${toDateStr(new Date())}-rev${data.revision ?? 0}.json`;
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setBackupMsg({ ok: true, text: `Saved ${name} to your browser's download folder.` });
+    } catch (err) {
+      setBackupMsg({ ok: false, text: 'Could not download a backup. Check your connection and try again.' });
+    }
+  };
+
+  // Editing form for one ticker's inputs (the DCF tab). Fair value is calculated live from it.
   const [dcfTicker, setDcfTicker] = useState('');
   const [dcfCompany, setDcfCompany] = useState('');
   const [dcfCurrency, setDcfCurrency] = useState('USD');
+  const [dcfBasis, setDcfBasis] = useState('perShare'); // 'perShare' | 'total'
   const [dcfStartingFcf, setDcfStartingFcf] = useState('');
+  const [dcfShares, setDcfShares] = useState('');
+  const [dcfNetDebt, setDcfNetDebt] = useState('');
   const [dcfCurrentPrice, setDcfCurrentPrice] = useState('');
   const [dcfGrowthRate, setDcfGrowthRate] = useState(10);
   const [dcfYears, setDcfYears] = useState(5);
   const [dcfTerminalGrowth, setDcfTerminalGrowth] = useState(2.5);
   const [dcfDiscountRate, setDcfDiscountRate] = useState(9);
-
-  // Sell price = fair value plus a premium; saved valuations show on the dashboard.
-  const [dcfSellPremium, setDcfSellPremium] = useState(20);
+  const [dcfSellPremium, setDcfSellPremium] = useState(20); // sell price = fair value plus this premium
   const [dcfSaveTicker, setDcfSaveTicker] = useState('');
+  const [dcfReportDate, setDcfReportDate] = useState('');
   const [dcfNote, setDcfNote] = useState('');
   const [dcfSaveMsg, setDcfSaveMsg] = useState(null);
 
-  const saveDcfValuation = () => {
-    const ticker = dcfSaveTicker.trim().toUpperCase();
-    if (!ticker) { setDcfSaveMsg({ ok: false, text: 'Enter the ticker to save this valuation under.' }); return; }
-    if (!dcfResult) { setDcfSaveMsg({ ok: false, text: 'There is no valid valuation to save yet.' }); return; }
-    const premium = Number.isFinite(dcfSellPremium) ? dcfSellPremium : 0;
-    const price = parseNum(dcfCurrentPrice);
-    setDcfValuations((prev) => ({
-      ...prev,
-      [ticker]: {
-        ticker,
-        company: dcfCompany.trim() || ticker,
-        currency: dcfCurrency,
-        fairValue: Math.round(dcfResult.fairValue * 100) / 100,
-        sellPremiumPct: premium,
-        sellPrice: Math.round(dcfResult.fairValue * (1 + premium / 100) * 100) / 100,
-        priceAtAnalysis: price > 0 ? price : null,
-        startingFcf: parseNum(dcfStartingFcf),
-        growthRate: dcfGrowthRate,
-        years: dcfYears,
-        terminalGrowth: dcfTerminalGrowth,
-        discountRate: dcfDiscountRate,
-        note: dcfNote.trim(),
-        savedAt: toDateStr(new Date()),
-      },
-    }));
+  const resetDcfForm = () => {
+    setDcfBasis('perShare'); setDcfStartingFcf(''); setDcfShares(''); setDcfNetDebt('');
+    setDcfGrowthRate(10); setDcfYears(5); setDcfTerminalGrowth(2.5); setDcfDiscountRate(9);
+    setDcfSellPremium(20); setDcfReportDate(''); setDcfNote('');
+  };
+
+  const loadDcfEntry = (e) => {
+    const n = (v, fallback) => (Number.isFinite(parseNum(v)) ? parseNum(v) : fallback);
+    setDcfSaveTicker(e.ticker);
+    setDcfCompany(e.company || e.ticker);
+    setDcfCurrency(e.currency || 'USD');
+    setDcfBasis(e.fcfBasis === 'total' ? 'total' : 'perShare');
+    setDcfStartingFcf(String(e.startingFcf ?? ''));
+    setDcfShares(String(e.sharesOutstanding ?? ''));
+    setDcfNetDebt(String(e.netDebt ?? ''));
+    setDcfCurrentPrice(e.priceAtAnalysis > 0 ? String(e.priceAtAnalysis) : '');
+    setDcfGrowthRate(n(e.growthRate, 10));
+    setDcfYears(Math.round(n(e.years, 5)));
+    setDcfTerminalGrowth(n(e.terminalGrowth, 2.5));
+    setDcfDiscountRate(n(e.discountRate, 9));
+    setDcfSellPremium(n(e.sellPremiumPct, 20));
+    setDcfReportDate(isValidIsoDate(e.nextReportDate) ? e.nextReportDate : '');
+    setDcfNote(e.note || '');
+  };
+
+  // The form as a stored-inputs entry (also what gets saved).
+  const dcfFormInputs = {
+    ticker: dcfKey(dcfSaveTicker),
+    company: dcfCompany.trim() || dcfKey(dcfSaveTicker),
+    currency: dcfCurrency,
+    fcfBasis: dcfBasis,
+    startingFcf: dcfStartingFcf,
+    sharesOutstanding: dcfShares,
+    netDebt: dcfNetDebt,
+    growthRate: dcfGrowthRate,
+    years: dcfYears,
+    terminalGrowth: dcfTerminalGrowth,
+    discountRate: dcfDiscountRate,
+    sellPremiumPct: dcfSellPremium,
+    nextReportDate: dcfReportDate,
+    note: dcfNote.trim(),
+    priceAtAnalysis: parseNum(dcfCurrentPrice) > 0 ? parseNum(dcfCurrentPrice) : null,
+  };
+
+  const saveDcfInputs = () => {
+    const ticker = dcfKey(dcfSaveTicker);
+    if (!ticker) { setDcfSaveMsg({ ok: false, text: 'Enter the ticker to save these inputs under.' }); return; }
+    const problems = validateInputs(dcfFormInputs);
+    if (problems.length > 0) { setDcfSaveMsg({ ok: false, text: problems[0] }); return; }
+    commitDcfInputs((m) => ({ ...m, [ticker]: { ...dcfFormInputs, ticker, updatedAt: toDateStr(new Date()) } }));
     setDcfSaveMsg({ ok: true, text: `Saved for ${ticker}. It now shows on the dashboard.` });
   };
 
+  // Clears the valuation for a ticker. A saved report date is kept; the entry goes only if nothing else is left.
   const removeDcfValuation = (ticker) => {
-    setDcfValuations((prev) => {
-      const next = { ...prev };
-      delete next[ticker];
+    commitDcfInputs((m) => {
+      const t = dcfKey(ticker);
+      const e = m[t];
+      if (!e) return m;
+      const next = { ...m };
+      if (isValidIsoDate(e.nextReportDate)) next[t] = { ...e, startingFcf: '', sharesOutstanding: '', netDebt: '', priceAtAnalysis: null };
+      else delete next[t];
       return next;
     });
+  };
+
+  // Next report date per held ticker, edited on the DCF tab. Works for holdings that have no valuation.
+  const setReportDateFor = (ticker, value) => {
+    const t = dcfKey(ticker);
+    if (value !== '' && !isValidIsoDate(value)) return;
+    commitDcfInputs((m) => {
+      const known = knownTickers[ticker] || {};
+      const e = m[t] || { ticker: t, company: known.company || t, currency: known.currency || 'USD', fcfBasis: 'perShare', startingFcf: '', sharesOutstanding: '', netDebt: '', growthRate: '', years: '', terminalGrowth: '', discountRate: '', sellPremiumPct: 0, nextReportDate: '', note: '', priceAtAnalysis: null, updatedAt: '' };
+      const next = { ...m };
+      if (value === '' && !valuationFromInputs(e)) delete next[t];
+      else next[t] = { ...e, nextReportDate: value, updatedAt: toDateStr(new Date()) };
+      return next;
+    });
+    if (dcfKey(dcfSaveTicker) === t) setDcfReportDate(value);
   };
 
   // Where the current price sits against a saved valuation. Compared in USD so a
@@ -1021,23 +1147,35 @@ export default function Home() {
     return { label: 'Below fair value', tone: 'pos', vsFairPct };
   };
 
+  const valuations = useMemo(
+    () => Object.values(effectiveInputs).map(valuationFromInputs).filter(Boolean),
+    [effectiveInputs]
+  );
+
   const valuationByTicker = useMemo(() => {
     const m = {};
-    Object.values(dcfValuations).forEach((v) => { m[String(v.ticker).toUpperCase()] = v; });
+    valuations.forEach((v) => { m[v.ticker] = v; });
     return m;
-  }, [dcfValuations]);
+  }, [valuations]);
 
   const valuationRows = useMemo(() => {
-    return Object.values(dcfValuations).map((v) => {
-      const held = groupedHoldings.find((g) => String(g.ticker).toUpperCase() === String(v.ticker).toUpperCase());
+    return valuations.map((v) => {
+      const held = groupedHoldings.find((g) => dcfKey(g.ticker) === v.ticker);
       const price = held ? held.currentPrice : v.priceAtAnalysis;
       const priceCurrency = held ? held.currency : v.currency;
       return { ...v, held: !!held, price, priceCurrency, status: valuationStatus(price, priceCurrency, v) };
     }).sort((a, b) => (a.status?.vsFairPct ?? 1e9) - (b.status?.vsFairPct ?? 1e9));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dcfValuations, groupedHoldings, fxRates]);
+  }, [valuations, groupedHoldings, fxRates]);
 
-  // Paste box for the JSON the "DCF Workbench" artifact copies out.
+  // Next report dates for the holdings in the current view: upcoming first, past ones (greyed) last.
+  const reportRows = useMemo(
+    () => upcomingReports(effectiveInputs, groupedHoldings.map((g) => g.ticker), toDateStr(new Date())),
+    [effectiveInputs, groupedHoldings]
+  );
+
+  // Paste box for the JSON the "DCF Workbench" artifact copies out. Optional extra fields are used when
+  // present: fcfBasis ('perShare' | 'total'), sharesOutstanding, netDebt, sellPremiumPct, nextReportDate.
   const [dcfImportText, setDcfImportText] = useState('');
   const [dcfImportMsg, setDcfImportMsg] = useState(null);
 
@@ -1048,19 +1186,27 @@ export default function Home() {
       const fcf = Number(d.startingFcf);
       if (!Number.isFinite(fcf) || fcf <= 0) throw new Error('missing starting FCF');
       const clampNum = (v, lo, hi, fallback) => (Number.isFinite(Number(v)) ? Math.min(hi, Math.max(lo, Number(v))) : fallback);
+      const ticker = dcfKey(d.ticker);
       const known = d.ticker && uniqueTickers.includes(d.ticker) ? d.ticker : '';
+      const saved = effectiveInputs[ticker];
       setDcfTicker(known);
-      setDcfSaveTicker(String(d.ticker || '').toUpperCase());
+      setDcfSaveTicker(ticker);
       setDcfCompany(String(d.company || d.ticker || ''));
       if (typeof d.currency === 'string' && d.currency) setDcfCurrency(d.currency);
+      const total = d.fcfBasis === 'total';
+      setDcfBasis(total ? 'total' : 'perShare');
       setDcfStartingFcf(String(fcf));
+      setDcfShares(total && Number(d.sharesOutstanding) > 0 ? String(d.sharesOutstanding) : '');
+      setDcfNetDebt(total && Number.isFinite(Number(d.netDebt)) && d.netDebt !== '' && d.netDebt != null ? String(d.netDebt) : '');
       setDcfCurrentPrice(Number(d.currentPrice) > 0 ? String(d.currentPrice) : '');
       setDcfGrowthRate(clampNum(d.growthRate, -10, 40, 10));
       setDcfYears(Math.round(clampNum(d.years, 1, 15, 5)));
       setDcfTerminalGrowth(clampNum(d.terminalGrowth, 0, 5, 2.5));
       setDcfDiscountRate(clampNum(d.discountRate, 1, 20, 9));
+      setDcfSellPremium(clampNum(d.sellPremiumPct, 0, 60, saved?.sellPremiumPct != null && saved.sellPremiumPct !== '' ? Number(saved.sellPremiumPct) : 20));
+      setDcfReportDate(isValidIsoDate(d.nextReportDate) ? d.nextReportDate : (saved && isValidIsoDate(saved.nextReportDate) ? saved.nextReportDate : ''));
       setDcfImportText('');
-      setDcfImportMsg({ ok: true, text: 'Imported' + (d.company ? ` ${d.company}` : '') + '.' });
+      setDcfImportMsg({ ok: true, text: 'Imported' + (d.company ? ` ${d.company}` : '') + '. Review it, then press Save inputs to keep it.' });
     } catch (err) {
       setDcfImportMsg({ ok: false, text: "That doesn't look like a DCF Workbench export. Use the Copy for Commingled button and paste the whole text." });
     }
@@ -1069,38 +1215,37 @@ export default function Home() {
   const loadDcfFromHolding = (ticker) => {
     setDcfTicker(ticker);
     if (!ticker) return;
-    setDcfSaveTicker(ticker.toUpperCase());
+    const t = dcfKey(ticker);
     const known = knownTickers[ticker];
     const held = groupedHoldings.find((g) => g.ticker === ticker);
-    setDcfCompany(known?.company || ticker);
-    setDcfCurrency(held?.currency || known?.currency || 'USD');
+    const saved = effectiveInputs[t];
+    if (saved) loadDcfEntry(saved);
+    else {
+      resetDcfForm();
+      setDcfSaveTicker(t);
+      setDcfCompany(known?.company || ticker);
+      setDcfCurrency(held?.currency || known?.currency || 'USD');
+      setDcfCurrentPrice('');
+    }
     if (held?.currentPrice) setDcfCurrentPrice(String(held.currentPrice));
   };
 
   const dcfResult = useMemo(() => {
-    const fcf0 = parseNum(dcfStartingFcf);
-    const result = computeDcfFairValue(fcf0, dcfGrowthRate / 100, dcfYears, dcfTerminalGrowth / 100, dcfDiscountRate / 100);
+    const result = fairValueFromInputs(dcfFormInputs);
     if (!result) return null;
     const currentPrice = parseNum(dcfCurrentPrice);
-    const upsidePct = currentPrice > 0 ? ((result.fairValue - currentPrice) / currentPrice) * 100 : null;
-    return { ...result, currentPrice: currentPrice > 0 ? currentPrice : null, upsidePct };
-  }, [dcfStartingFcf, dcfGrowthRate, dcfYears, dcfTerminalGrowth, dcfDiscountRate, dcfCurrentPrice]);
+    return { ...result, currentPrice: currentPrice > 0 ? currentPrice : null, upsidePct: upsidePct(result.fairValue, currentPrice) };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dcfBasis, dcfStartingFcf, dcfShares, dcfNetDebt, dcfGrowthRate, dcfYears, dcfTerminalGrowth, dcfDiscountRate, dcfSellPremium, dcfCurrentPrice]);
 
   // A classic DCF sensitivity grid — discount rate vs. terminal growth —
   // centered on the current sliders, so you can see at a glance how exposed
   // the fair value is to the two assumptions that matter most.
-  const dcfSensitivity = useMemo(() => {
-    const fcf0 = parseNum(dcfStartingFcf);
-    if (!fcf0 || fcf0 <= 0) return null;
-    const steps = [-1, -0.5, 0, 0.5, 1];
-    const discountSteps = steps.map((d) => Math.round((dcfDiscountRate + d) * 100) / 100);
-    const terminalSteps = steps.map((d) => Math.round((dcfTerminalGrowth + d) * 100) / 100);
-    const grid = discountSteps.map((rPct) => terminalSteps.map((tgPct) => {
-      const r = computeDcfFairValue(fcf0, dcfGrowthRate / 100, dcfYears, tgPct / 100, rPct / 100);
-      return r ? r.fairValue : null;
-    }));
-    return { discountSteps, terminalSteps, grid };
-  }, [dcfStartingFcf, dcfGrowthRate, dcfYears, dcfDiscountRate, dcfTerminalGrowth]);
+  const dcfSensitivity = useMemo(
+    () => sensitivityGrid(dcfFormInputs),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [dcfBasis, dcfStartingFcf, dcfShares, dcfNetDebt, dcfGrowthRate, dcfYears, dcfDiscountRate, dcfTerminalGrowth]
+  );
 
   const [divForm, setDivForm] = useState({ ticker: '', amount: '', currency: 'USD', date: toDateStr(new Date()), ownerIds: [] });
   const [divError, setDivError] = useState('');
@@ -1275,6 +1420,7 @@ export default function Home() {
         .ct-asset-company { color: var(--text-faint); font-size: 11px; margin-top: 1px; }
         .ct-source-flag { font-size: 9px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-family: 'Inter'; font-weight: 700; text-transform: uppercase; cursor: help; }
         .ct-source-flag.manual { color: var(--gold); border-color: var(--gold); }
+        .ct-notice { border: 1px solid var(--gold); border-radius: 10px; padding: 12px 14px; background: var(--surface-hover); }
         .ct-val-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 3px; font-size: 11px; color: var(--text-faint); }
         .ct-val-line b { color: var(--text); font-weight: 500; }
         .ct-val-tag { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 100px; border: 1px solid var(--border); color: var(--text-muted); }
@@ -1285,6 +1431,9 @@ export default function Home() {
         .ct-val-row { display: grid; grid-template-columns: 2.2fr 1fr 1fr 1.3fr 1.8fr 40px; gap: 8px; padding: 13px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
         .ct-val-row:last-child { border-bottom: none; }
         .ct-val-row:hover { background: var(--surface-hover); }
+        .ct-rep-row { display: grid; grid-template-columns: 2.2fr 1.2fr 1.4fr; gap: 8px; padding: 12px 18px; align-items: center; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .ct-rep-row:last-child { border-bottom: none; }
+        .ct-rep-row.past { opacity: 0.5; }
         .ct-mono { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
         .ct-owner-pills { display: flex; flex-wrap: wrap; gap: 4px; }
         .ct-owner-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 100px; font-size: 10.5px; font-weight: 700; border: 1px solid; }
@@ -1360,6 +1509,8 @@ export default function Home() {
         @media (max-width: 640px) {
           .ct-ledger-head, .ct-sold-head, .ct-div-head, .ct-val-head { display: none; }
           .ct-val-row { grid-template-columns: 1fr 1fr; row-gap: 8px; padding: 16px; }
+          .ct-rep-row { grid-template-columns: 1fr auto; row-gap: 6px; padding: 14px 16px; }
+          .ct-rep-row > :first-child { grid-column: 1 / -1; }
           .ct-val-row > :first-child { grid-column: 1 / -1; }
 
           .ct-ledger-row, .ct-sold-row, .ct-div-row {
@@ -1407,7 +1558,7 @@ export default function Home() {
               <span className={`ct-live-dot ${unavailableTickers.length ? 'error' : ''}`} />
               {quotesLoading ? 'Fetching quotes…' : unavailableTickers.length ? `${unavailableTickers.join(', ')} unavailable right now` : `Updated ${secondsAgo != null ? `${secondsAgo}s ago` : ''}`}
               {' · '}
-              {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save failed' : hasLoadedState ? 'Saved' : 'Loading your data…'}
+              {saveStatus === 'stale' ? <span style={{ color: 'var(--neg)' }}>Updated elsewhere — reloading to get the latest…</span> : saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save failed' : hasLoadedState ? 'Saved' : 'Loading your data…'}
             </div>
           </div>
         </div>
@@ -1544,12 +1695,34 @@ export default function Home() {
           </div>
         </div>
 
+        {reportRows.length > 0 && (
+          <>
+            <div className="ct-section-title">Upcoming reports</div>
+            <div className="ct-section-sub">{filterLabel} · dates are filled in by hand on the DCF tab · past dates are greyed out at the bottom</div>
+            <div className="ct-ledger">
+              {reportRows.map((r) => {
+                const when = r.daysUntil === 0 ? 'Today' : r.daysUntil === 1 ? 'Tomorrow' : r.daysUntil > 1 ? `in ${r.daysUntil} days` : r.daysUntil === -1 ? 'Yesterday' : `${-r.daysUntil} days ago`;
+                return (
+                  <div className={`ct-rep-row${r.isPast ? ' past' : ''}`} key={r.ticker}>
+                    <div className="ct-asset-name">
+                      <span className="ct-asset-ticker">{r.company}</span>
+                      <span className="ct-asset-company">{r.ticker}</span>
+                    </div>
+                    <div className="ct-mono">{formatDateDisplay(r.date)}</div>
+                    <div><span className={`ct-val-tag${!r.isPast && r.daysUntil <= 7 ? ' warn' : ''}`}>{when}</span></div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
         {valuationRows.length > 0 && (
           <>
             <div className="ct-section-title">Valuations</div>
-            <div className="ct-section-sub">Saved DCF analyses · sorted by how far the price sits below (or above) fair value · sell price = fair value plus the premium set when saving · edit them on the DCF tab</div>
+            <div className="ct-section-sub">Estimates that depend on the assumptions you entered · sorted by how far the price sits below (or above) fair value · sell price = fair value plus the premium set when saving · edit them on the DCF tab</div>
             <div className="ct-ledger">
-              <div className="ct-val-head"><div>Stock</div><div>Price</div><div>Fair value</div><div>Sell price</div><div>Status</div><div /></div>
+              <div className="ct-val-head"><div>Stock</div><div>Price</div><div>Fair value (est.)</div><div>Sell price</div><div>Status</div><div /></div>
               {valuationRows.map((r) => (
                 <div className="ct-val-row" key={r.ticker}>
                   <div className="ct-asset-name">
@@ -1587,7 +1760,7 @@ export default function Home() {
                     const st = valuationStatus(g.currentPrice, g.currency, v);
                     return (
                       <span className="ct-val-line" title={`DCF saved ${v.savedAt}${v.note ? ` — ${v.note}` : ''}`}>
-                        <span>Fair <b className="ct-mono">{fmtMoney(v.fairValue, v.currency)}</b></span>
+                        <span>Est. fair <b className="ct-mono">{fmtMoney(v.fairValue, v.currency)}</b></span>
                         <span>Sell <b className="ct-mono">{fmtMoney(v.sellPrice, v.currency)}</b></span>
                         {st && <span className={`ct-val-tag ${st.tone}`}>{st.label}</span>}
                       </span>
@@ -2048,9 +2221,27 @@ export default function Home() {
           <div className="ct-panel-head">
             <div>
               <div className="ct-panel-title">DCF Analysis</div>
-              <div className="ct-panel-sub">Discounted cash flow fair-value calculator — adjust the assumptions to see how the valuation moves</div>
+              <div className="ct-panel-sub">Discounted cash flow fair-value calculator — adjust the assumptions to see how the valuation moves. Fair values are estimates that depend entirely on the assumptions you enter.</div>
             </div>
+            <button type="button" className="ct-sell-btn" onClick={downloadBackup} title="Download everything saved in the app as a JSON file">Download backup</button>
           </div>
+          {backupMsg && <div style={{ fontSize: 12, marginTop: 6, color: backupMsg.ok ? 'var(--pos)' : 'var(--neg)' }}>{backupMsg.text}</div>}
+
+          {!dcfMigration && legacyMigration.report.count > 0 && (
+            <div className="ct-notice" style={{ marginTop: 14 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>Saved valuations use the older format</div>
+              <div className="ct-field-hint" style={{ marginTop: 4 }}>
+                {legacyMigration.report.count} saved valuation{legacyMigration.report.count === 1 ? '' : 's'} still show correctly. Migrating copies {legacyMigration.report.count === 1 ? 'it' : 'them'} into the new inputs format
+                (which also holds shares outstanding and next report dates). The old data stays in the saved state, untouched, until you say it can go.
+                Download a backup first.
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                <button type="button" className="ct-sell-btn" onClick={downloadBackup}>Download backup</button>
+                <button type="button" className="ct-add-btn" onClick={migrateDcfNow}>Migrate now</button>
+              </div>
+            </div>
+          )}
+          {dcfMigrateMsg && <div style={{ fontSize: 12, marginTop: 8, color: dcfMigrateMsg.ok ? 'var(--pos)' : 'var(--neg)' }}>{dcfMigrateMsg.text}</div>}
 
           <div className="ct-field" style={{ marginTop: 14 }}>
             <label>Import from DCF Workbench (optional)</label>
@@ -2081,15 +2272,37 @@ export default function Home() {
               <input value={dcfCompany} onChange={(e) => setDcfCompany(e.target.value)} placeholder="Company name" />
             </div>
             <div className="ct-field">
-              <label>Starting FCF / share</label>
+              <label>Cash flow entered as</label>
+              <select className="ct-currency-select" style={{ width: '100%' }} value={dcfBasis} onChange={(e) => setDcfBasis(e.target.value)}>
+                <option value="perShare">Per share</option>
+                <option value="total">Total company figure (÷ shares outstanding)</option>
+              </select>
+            </div>
+            <div className="ct-field">
+              <label>{dcfBasis === 'total' ? 'Starting free cash flow (total)' : 'Starting FCF / share'}</label>
               <div style={{ display: 'flex', gap: 6 }}>
-                <input type="number" step="0.01" value={dcfStartingFcf} onChange={(e) => setDcfStartingFcf(e.target.value)} placeholder="5.00" style={{ flex: 1 }} />
+                <input type="number" step="0.01" value={dcfStartingFcf} onChange={(e) => setDcfStartingFcf(e.target.value)} placeholder={dcfBasis === 'total' ? '1,400' : '5.00'} style={{ flex: 1 }} />
                 <select className="ct-currency-select" value={dcfCurrency} onChange={(e) => setDcfCurrency(e.target.value)}>
                   {DISPLAY_CURRENCIES.includes(dcfCurrency) ? null : <option value={dcfCurrency}>{dcfCurrency}</option>}
                   {DISPLAY_CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
+              <div className="ct-field-hint">In the stock's own currency.</div>
             </div>
+            {dcfBasis === 'total' && (
+              <>
+                <div className="ct-field">
+                  <label>Shares outstanding</label>
+                  <input type="number" step="any" min="0" value={dcfShares} onChange={(e) => setDcfShares(e.target.value)} placeholder="1,420" />
+                  <div className="ct-field-hint">Same units as the total (for example both in millions).</div>
+                </div>
+                <div className="ct-field">
+                  <label>Net debt (optional)</label>
+                  <input type="number" step="any" value={dcfNetDebt} onChange={(e) => setDcfNetDebt(e.target.value)} placeholder="Debt positive, net cash negative" />
+                  <div className="ct-field-hint">Use when the cash flow is before debt holders. Subtracted before dividing by shares.</div>
+                </div>
+              </>
+            )}
             <div className="ct-field">
               <label>Current price (optional)</label>
               <input type="number" step="0.01" value={dcfCurrentPrice} onChange={(e) => setDcfCurrentPrice(e.target.value)} placeholder="For upside/downside" />
@@ -2123,10 +2336,13 @@ export default function Home() {
             <>
               <div className="ct-dcf-result">
                 <div>
-                  <div className="ct-card-label">Fair Value / Share{dcfCompany ? ` — ${dcfCompany}` : ''}</div>
+                  <div className="ct-card-label">Estimated fair value / share{dcfCompany ? ` — ${dcfCompany}` : ''}</div>
                   <div className="ct-card-value" style={{ fontSize: 34 }}>{fmtMoney(dcfResult.fairValue, dcfCurrency)}</div>
                   <div className="ct-field-hint" style={{ marginTop: 6 }}>
-                    Sell price <span className="ct-mono">{fmtMoney(dcfResult.fairValue * (1 + dcfSellPremium / 100), dcfCurrency)}</span> (fair value + {dcfSellPremium.toFixed(0)}%)
+                    {dcfResult.sellPrice != null
+                      ? <>Sell price <span className="ct-mono">{fmtMoney(dcfResult.sellPrice, dcfCurrency)}</span> (fair value + {dcfSellPremium.toFixed(0)}%)</>
+                      : 'No sell price: the estimated value is not positive.'}
+                    {' · '}an estimate that depends on your assumptions
                   </div>
                   {dcfResult.upsidePct != null && (
                     <div className={`ct-badge ${dcfResult.upsidePct >= 0 ? 'pos' : 'neg'}`} style={{ marginTop: 8 }}>
@@ -2138,6 +2354,12 @@ export default function Home() {
                 <div className="ct-dcf-breakdown">
                   <div className="ct-legend-row"><span className="ct-legend-left">PV of projected cash flows</span><span className="ct-legend-val">{fmtMoney(dcfResult.pvSum, dcfCurrency)}</span></div>
                   <div className="ct-legend-row"><span className="ct-legend-left">PV of terminal value</span><span className="ct-legend-val">{fmtMoney(dcfResult.pvTerminal, dcfCurrency)}</span></div>
+                  {dcfResult.netDebtPerShare !== 0 && (
+                    <div className="ct-legend-row"><span className="ct-legend-left">{dcfResult.netDebtPerShare > 0 ? 'Less: net debt / share' : 'Plus: net cash / share'}</span><span className="ct-legend-val">{fmtMoney(Math.abs(dcfResult.netDebtPerShare), dcfCurrency)}</span></div>
+                  )}
+                  {dcfBasis === 'total' && (
+                    <div className="ct-legend-row"><span className="ct-legend-left">Starting FCF / share</span><span className="ct-legend-val">{fmtMoney(dcfResult.perShareFcf, dcfCurrency)}</span></div>
+                  )}
                 </div>
               </div>
 
@@ -2187,12 +2409,16 @@ export default function Home() {
                 </>
               )}
 
-              <div className="ct-panel-sub" style={{ marginTop: 22 }}>Save to dashboard</div>
-              <div className="ct-field-hint" style={{ marginBottom: 8 }}>Shows the fair value and sell price next to the stock on the dashboard, and in the Valuations list. Saving the same ticker again replaces the earlier valuation.</div>
+              <div className="ct-panel-sub" style={{ marginTop: 22 }}>Save inputs</div>
+              <div className="ct-field-hint" style={{ marginBottom: 8 }}>Saves these inputs for the ticker. The estimated fair value and sell price then show next to the stock on the dashboard and in the Valuations list, recalculated from the inputs. Saving the same ticker again replaces the earlier inputs.</div>
               <div className="ct-form-grid">
                 <div className="ct-field">
                   <label>Ticker to save under</label>
                   <input value={dcfSaveTicker} onChange={(e) => { setDcfSaveTicker(e.target.value); setDcfSaveMsg(null); }} placeholder="e.g. ALMB.CO (as in Holdings)" />
+                </div>
+                <div className="ct-field">
+                  <label>Next report date (optional)</label>
+                  <input type="date" value={dcfReportDate} onChange={(e) => setDcfReportDate(e.target.value)} />
                 </div>
                 <div className="ct-field">
                   <label>Note (optional)</label>
@@ -2200,20 +2426,40 @@ export default function Home() {
                 </div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 }}>
-                <button type="button" className="ct-add-btn" onClick={saveDcfValuation}>
-                  {dcfValuations[dcfSaveTicker.trim().toUpperCase()] ? 'Update saved valuation' : 'Save valuation'}
+                <button type="button" className="ct-add-btn" onClick={saveDcfInputs}>
+                  {effectiveInputs[dcfKey(dcfSaveTicker)] ? 'Update saved inputs' : 'Save inputs'}
                 </button>
                 {dcfSaveMsg && <span style={{ fontSize: 12, color: dcfSaveMsg.ok ? 'var(--pos)' : 'var(--neg)' }}>{dcfSaveMsg.text}</span>}
               </div>
             </>
           ) : (
-            <div className="ct-empty" style={{ marginTop: 18 }}>Enter a starting FCF per share above to see the valuation (discount rate must be higher than the terminal growth rate)</div>
+            <div className="ct-empty" style={{ marginTop: 18 }}>
+              {validateInputs(dcfFormInputs)[0] || 'Enter the cash flow above to see the valuation.'}
+            </div>
           )}
+
+          <div className="ct-panel-sub" style={{ marginTop: 26 }}>Next report dates</div>
+          <div className="ct-field-hint" style={{ marginBottom: 8 }}>One date per holding, filled in by hand. Saved with the holding's inputs; no valuation needed.</div>
+          <div className="ct-form-grid">
+            {uniqueTickers.map((t) => (
+              <div className="ct-field" key={t}>
+                <label>{knownTickers[t]?.company || t} <span style={{ color: 'var(--text-faint)' }}>· {t}</span></label>
+                <input
+                  type="date"
+                  value={isValidIsoDate(effectiveInputs[dcfKey(t)]?.nextReportDate) ? effectiveInputs[dcfKey(t)].nextReportDate : ''}
+                  onChange={(e) => setReportDateFor(t, e.target.value)}
+                />
+              </div>
+            ))}
+            {uniqueTickers.length === 0 && <div className="ct-empty">No holdings yet.</div>}
+          </div>
         </div>
         )}
 
         <div style={{ color: 'var(--text-faint)', fontSize: 11.5, textAlign: 'center', marginTop: 30 }}>
           Shared between anyone who opens this app — changes save automatically and sync across devices.
+          {' · '}
+          <button type="button" onClick={downloadBackup} style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', textDecoration: 'underline', cursor: 'pointer', font: 'inherit' }}>Download backup</button>
         </div>
       </div>
     </div>

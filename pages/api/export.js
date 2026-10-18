@@ -86,6 +86,8 @@ export default async function handler(req, res) {
   return res.status(200).json({
     exportedAt: new Date().toISOString(),
     owners: owners.map((o) => o.name),
+    // Per-ticker DCF inputs as saved (see lib/dcf.js for the entry shape). Fair values are not stored; recalculate them from these.
+    dcfInputs: state.dcfInputs && typeof state.dcfInputs === 'object' ? state.dcfInputs : {},
     holdings,
     lots: lotRows,
     sales: sales.map((s) => ({
